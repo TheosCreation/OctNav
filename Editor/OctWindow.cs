@@ -50,8 +50,8 @@ namespace OctNav
                         marginBottom = 5
                     }
                 };
+                Texture2D logoTex = Resources.Load<Texture2D>("OctNavLogo");
 
-                Texture2D logoTex = AssetDatabase.LoadAssetAtPath<Texture2D>("Assets/OctNavLogo.png");
                 if (logoTex != null)
                 {
                     Image logoImage = new Image
@@ -66,6 +66,10 @@ namespace OctNav
                         }
                     };
                     headerContainer.Add(logoImage);
+                }
+                else
+                {
+                    Debug.Log("Oh no");
                 }
 
                 rootVisualElement.Add(headerContainer);

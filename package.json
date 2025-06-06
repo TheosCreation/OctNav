@@ -8,6 +8,11 @@
     "utils"
   ],
   "category": "Utils",
+  "samples": {
+    "displayName": "Ai Agent Sample",
+    "description": "showcases how the ai agents path",
+    "path": "Samples~/AiTesting"
+  },
   "type": "commonjs",
   "author": {
     "name": "OctNav",
