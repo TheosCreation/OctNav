@@ -1,15 +1,16 @@
-﻿using System.Collections.Generic;
+﻿using System;
+using System.Collections.Generic;
 using System.Linq;
-using Unity.VisualScripting;
 using UnityEngine;
-using Random = UnityEngine.Random;
+using UnityEngine.UIElements;
+using static Codice.Client.Common.WebApi.WebApiEndpoints;
 
 namespace OctNav
 {
     public class AgentPath
     {
         public List<Vector3> waypoints = new List<Vector3>();
-
+        public List<int> rawIndexMap = new List<int>();
         public void Clear()
         {
             waypoints.Clear();
@@ -20,452 +21,1044 @@ namespace OctNav
             waypoints.Add(point);
         }
 
+
         public int length => waypoints.Count;
-        public float travelDistance { get
+        public float travelDistance {
+            get
             {
+                if (waypoints.Count < 2) return 0f;
                 float currentDist = 0f;
                 Vector3 lastPoint = waypoints[0];
-                for (int i = 1; i<waypoints.Count; i++) 
+                for (int i = 1; i < waypoints.Count; i++)
                 {
                     currentDist += Vector3.Distance(lastPoint, waypoints[i]);
                     lastPoint = waypoints[i];
                 }
                 return currentDist;
-            } 
+            }
         }
-        
+        public float ClosestDistanceToPoint(Vector3 point)
+        {
+            if (waypoints.Count < 2) return Vector3.Distance(point, waypoints.Count == 1 ? waypoints[0] : Vector3.zero);
 
-        public Vector3 this[int i] => waypoints[i];
+            float minDistance = float.MaxValue;
+
+            for (int i = 0; i < waypoints.Count - 1; i++)
+            {
+                Vector3 a = waypoints[i];
+                Vector3 b = waypoints[i + 1];
+                
+                Vector3 ab = b - a;
+                Vector3 ap = point - a;
+                float t = Vector3.Dot(ap, ab) / ab.sqrMagnitude;
+                // cosine of the angle from the ap and ab vectors https://www.desmos.com/calculator/mdifkrdpoy\
+                // gets like index of closest point
+
+                t = Mathf.Clamp01(t);
+                //clamp it
+
+                Vector3 closestPoint = a + t * ab;
+                // just turns that index to the closest point
+                float distance = Vector3.Distance(point, closestPoint);
+
+                if (distance < minDistance)
+                {
+                    minDistance = distance;
+                }
+            }
+
+            return minDistance;
+        }
+    
+        public Vector3 GetDirection(int i)
+        {
+            if (i < 0 || i >= waypoints.Count - 1 || length<2)
+            {
+                return Vector3.zero;
+            }
+            Vector3 a = this[i];
+            Vector3 b = this[i + 1];
+            return (b-a).normalized;
+        }
+
+        public Vector3 this[int i]
+        {
+            get
+            {
+                if (i < 0 || i >= waypoints.Count)
+                {
+                    return waypoints.Count > 0 ? waypoints[waypoints.Count - 1] : Vector3.zero;
+                }
+                return waypoints[i];
+            }
+        }
     }
 
+    [RequireComponent(typeof(Rigidbody))]
     public class OctreeNavigationAgent : MonoBehaviour
     {
         [Header("Base Locomotion")]
-        public float baseSpeed = 5f;
+        public float maxSpeed = 5f;
+        public float acceleration = 5f;
         public float accuracy = 1f;
         public float turnSpeed = 5f;
+        public float stoppingDistance = 5f;
+        public float deceleration = 5f;
+
+        [Header("Path Recalculating")]
+        [SerializeField] private float maxDistanceFromPath = 5f;
+        [SerializeField] private float targetMoveThreshold = 0.1f;
 
         [Header("Path Smoothing")]
-        public bool enableSmoothing = true;
+        bool enableSmoothing = true;
         public float agentRadius = 0.5f;
-        public LayerMask geometryMask;
-        public int maxSmoothingSteps = 5;
-        public bool useLookAhead = false;
+        public bool enableRaycastSmoothing = true;
+        public int splineSubdivisionCount = 8;
+
+        [Header("Dynamic Repathing")]
+        public bool enableDynamicRepathing = true;
+        public int nodesAwayBeforeRepath = 1;
+        private bool isPreloadingNextPath = false;
+
 
         [Header("Octree Information")]
         public Transform target;
+        public Vector3 currcurrgoal;
 
-        [Header("Turn-Rate Clamping")]
-        public float maxTurnRate = 5f;
+        [Header("Pathfinding Settings")]
+        public HeuristicType heuristicType = HeuristicType.Euclidean;
+        public bool walking = false;
+        public bool straightPath = false;
+        public bool stayUpright = true;
+        public bool controlRotation = true;
+        public float maxStepDistance = 1f;
 
-        [Header("Speed Curves")]
-        public AnimationCurve speedOverDistance = AnimationCurve.Linear(0, 1, 1, 1);
-        public AnimationCurve speedOverTurning = AnimationCurve.Linear(0, 1, 5, 0.5f);
-
-        [Header("Ground-Only Settings")]
-        public bool groundOnly = false;
-        public float maxStepHeight = 0.5f;
-
-        List<Node> currentAStarPath = new List<Node>();
         public AgentPath currentPath = new AgentPath();
+        private List<Node> currentAStarPath = new List<Node>();
 
-        int currentWaypoint;
-        Vector3 lastForward;
-        OctNode currentNode;
+        [Header("Functionality")]
+        public bool isPaused { get; private set; } = false;
+        public bool isMoving { get; private set; } = false;
+        private Vector3? manualDestination = null;
+        public Vector3? currentGoal => manualDestination.HasValue ? manualDestination : target != null ? (Vector3?)target.position : null;
+        public Vector3? nextGoal = null;
+        public event Action OnDestinationReached;
+        public event Action<List<Vector3>> OnPathUpdated;
+        [Header("Utils")]
+        public LayerMask layerMask = ~0;
+        public bool rotationFrozen = false;
 
-        private bool waitingForNewPath = false;
+        [HideInInspector] public int currentWaypoint;
+
+        private Vector3 lastForward;
+        private OctNode currentNode;
+
         private bool forceNewPath = false;
-        private bool hasValidPath = false;
-        private int lookAheadSteps = 2;
+        private bool reachedDestination = false;
+
+        private List<List<Vector3>> portals = new List<List<Vector3>>();
+        private List<Vector3> viaPoints = new List<Vector3>();
+
+        private Rigidbody rb;
+        private Vector3 currentVelocity;
+        private Vector3 cashedVelocity;
+        private Vector3 cashedAngularVelocity;
+        private Vector3 targetCachedPosition;
+        private bool isOnGround;
+        private float groundCheckDistance = 0.2f;
+        private float maxSlopeAngle = 30f;
 
         private void Start()
         {
-            currentNode = OctNavigation.graph.GetClosestNode(transform.position);
-            lastForward = transform.forward;
-
-            if (target != null) PathToTarget();
-            else GetRandomDestination();
-        }
-
-        private void Update()
-        {
-            if (OctNavigation.graph == null) return;
-            foreach (var p in portals)
+            rb = GetComponent<Rigidbody>();
+            rb.isKinematic = false;
+            rb.interpolation = RigidbodyInterpolation.Interpolate;
+            rb.collisionDetectionMode = CollisionDetectionMode.Continuous;
+            if(walking)
             {
-                for (int i = 0; i < 4; i++)
-                    Debug.DrawLine(p[i], p[(i + 1) % 4], Color.magenta, 5f);
+                rb.useGravity = true;
             }
-            if (forceNewPath)
+            else
             {
-                forceNewPath = false;
-                SchedulePathRefresh();
+                rb.useGravity = false;
+            }
+
+                currentNode = OctNavigation.GetGraph(walking).GetClosestNode(transform.position);
+            lastForward = transform.forward;
+            isPreloadingNextPath = false;
+            forceNewPath = true;
+        }
+        private void FixedUpdate()
+        {
+            currcurrgoal = currentGoal ?? Vector3.zero;
+            if (OctNavigation.GetGraph(walking) == null || currentGoal == null) return;
+            GroundCheck();
+
+            if (Vector3.Distance(targetCachedPosition, currentGoal.Value) > targetMoveThreshold && !straightPath)
+            {
+                isPreloadingNextPath = false;
+                forceNewPath = true;
+            }
+            if (!reachedDestination && !isMoving)
+            {
+                reachedDestination = true;
+                ApplyStoppingForce();
+                OnDestinationReached?.Invoke();
+            }
+            if (!isMoving || isPaused)
+            {
+                ApplyStoppingForce();
                 return;
             }
 
-            if (currentAStarPath.Count == 0 || currentWaypoint >= currentAStarPath.Count)
+            /* if (stayUpright)
+             {
+                 Quaternion uprightRotation = Quaternion.LookRotation(transform.forward, Vector3.up);
+                 rb.MoveRotation(uprightRotation);
+
+             }*/
+            float distToGoal = Vector3.Distance(transform.position, currentGoal.Value);
+            if (distToGoal < stoppingDistance)
             {
-                if (!hasValidPath || currentWaypoint >= currentAStarPath.Count)
-                {
-                    if (!waitingForNewPath)
-                    {
-                        waitingForNewPath = true;
-                        Invoke(nameof(GetNewPath), 0.1f);
-                        SchedulePathRefresh();
-                    }
-                    return;
-                }
+                reachedDestination = true;
+                ApplyStoppingForce();
+                isMoving = false;
+                OnDestinationReached?.Invoke();
+                return;
             }
 
-            waitingForNewPath = false;
+            Vector3 nextWaypointPosition = currentPath[currentWaypoint];
+            float distToNextWaypoint = Vector3.Distance(transform.position, nextWaypointPosition);
 
-            if (currentWaypoint >= GetPathLength()) return;
-
-            Vector3 nextPos = currentPath[currentWaypoint];
-
-            float distTo = Vector3.Distance(transform.position, nextPos);
-
-            if (distTo < accuracy)
+            if (distToNextWaypoint < accuracy)
             {
                 currentWaypoint++;
-                return;
-            }
-
-            if (groundOnly)
-            {
-                float dy = nextPos.y - transform.position.y;
-                if (Mathf.Abs(dy) > maxStepHeight)
+                if (currentWaypoint >= currentPath.length)
                 {
-                    hasValidPath = false;
-                    forceNewPath = true;
-                    return;
+                    currentWaypoint = currentPath.length - 1;
                 }
             }
-
-            float percent = (float)currentWaypoint / (GetPathLength() - 1);
-            float modDist = speedOverDistance.Evaluate(percent);
-
-            Vector3 desiredDir = (nextPos - transform.position).normalized;
-            float angle = Vector3.Angle(lastForward, desiredDir) * Mathf.Deg2Rad;
-            float turnRate = angle / Time.deltaTime;
-            float modTurn = speedOverTurning.Evaluate(Mathf.Min(turnRate, maxTurnRate));
-
-            float finalSpeed = baseSpeed * modDist * modTurn;
-
-            transform.rotation = Quaternion.Slerp(
-                transform.rotation,
-                Quaternion.LookRotation(desiredDir, Vector3.up),
-                turnSpeed * Time.deltaTime
-            );
-
-            transform.position = Vector3.MoveTowards(
-                transform.position,
-                nextPos,
-                finalSpeed * Time.deltaTime
-            );
-
-            lastForward = transform.forward;
-        }
-
-        private Vector3 GetAdjustedCenter(int index)
-        {
-            OctNode current = GetPathNode(index);
-            OctNode next = GetPathNode(index + 1 < GetPathLength() ? index + 1 : index);
-            Vector3 dir = (next.bounds.center - current.bounds.center).normalized;
-            return current.bounds.center + Vector3.Scale(dir, current.bounds.extents * 0.5f);
-        }
-
-        private void SchedulePathRefresh()
-        {
-            CancelInvoke(nameof(GetNewPath));
-            Invoke(nameof(GetNewPath), 0.1f);
-        }
-
-        public int GetPathLength() => currentAStarPath?.Count ?? 0;
-
-        public OctNode GetPathNode(int index)
-        {
-            if (index < 0 || index >= currentAStarPath.Count)
-            {
-                Debug.LogError($"Index out of bounds. Path length: {currentAStarPath.Count}, Index: {index}");
-                return null;
-            }
-            return currentAStarPath[index].octreeNode;
-        }
-
-        private void GetNewPath()
-        {
-            waitingForNewPath = false;
-            if (OctNavigation.graph == null || OctNavigation.graph.nodes.Count == 0)
-            {
-                Debug.LogError("Graph is null or contains no nodes.");
-                hasValidPath = false;
-                return;
-            }
-
-            currentNode = OctNavigation.graph.GetClosestNode(transform.position);
-
-            if (target != null) PathToTarget();
-            else GetRandomDestination();
-        }
-        private AgentPath BuildLookaheadPath(List<Node> nodePath, Vector3 targetPosition )
-        {
-            AgentPath path = new AgentPath();
-            if (nodePath == null || nodePath.Count == 0) return path;
-
-            int nodeCount = nodePath.Count;
-            Vector3 previousPos = transform.position;
-
-            for (int i = 1; i < nodeCount; i++)
-            {
-                Node midNode = nodePath[i];
-                Bounds midBounds = midNode.octreeNode.bounds;
-                //shrink to fat agent radius
-                Bounds shrunk = new Bounds(midBounds.center, midBounds.size);
-                shrunk.Expand(-2f * agentRadius);
-                if (shrunk.size.x <= 0f || shrunk.size.y <= 0f || shrunk.size.z <= 0f)
+            if (!straightPath) { 
+                if (forceNewPath)
                 {
-                    shrunk = midBounds;
+                    GetNewPath();
+                    OnPathUpdated?.Invoke(currentPath.waypoints);
+                    forceNewPath = false;
                 }
-
-                int lookaheadIndex = i + lookAheadSteps;
-                Vector3 waypoint;
-
-                if (lookaheadIndex < nodeCount)
+                float pathDistance = PathDistance();
+                if (pathDistance > maxDistanceFromPath)
                 {
-                    // try to look ahead
-                    Vector3 lookaheadCenter = nodePath[lookaheadIndex].octreeNode.bounds.center;
-                    Vector3 direction = (lookaheadCenter - previousPos).normalized;
 
-                    Ray r = new Ray(previousPos, direction);
-                    if (shrunk.IntersectRay(r, out float dist))
+                    /*    if(pathDistance>maxDistanceFromPath*2 && currentWaypoint!=0)
+                        {
+                            Debug.Log("No suitable recovery waypoint found, recalculating path");
+                            forceNewPath = true;
+                        }
+                        else { */
+               
+                    int bestWaypoint = FindBestNextWaypoint();
+                    if (bestWaypoint != -1)
                     {
-
-                        waypoint = r.GetPoint(dist);
+                        currentWaypoint = bestWaypoint;
                     }
                     else
                     {
-                        waypoint = shrunk.ClosestPoint(lookaheadCenter);
+                        Debug.Log("No suitable recovery waypoint found, recalculating path");
+                        forceNewPath = true;
+                        return;
                     }
+                    //  }
+                }
+            }
+            /*   if (straightPath && isMoving && currentVelocity.magnitude < 0.05f)
+               {
+                   stuckTimer += Time.fixedDeltaTime;
+                   if (stuckTimer > 0.5f) // half-second of stuck time
+                   {
+                       Debug.LogWarning("Agent stuck mid-dash.");
+                       ApplyStoppingForce();
+                       isMoving = false;
+                       reachedDestination = true;
+                       OnDestinationReached?.Invoke();
+                       return;
+                   }
+               }
+               else
+               {
+                   stuckTimer = 0f;
+               }*/
+
+            if (currentPath.length == 0 || currentWaypoint >= currentPath.length)
+            {
+                if (!reachedDestination)
+                {
+                    reachedDestination = true;
+                    OnDestinationReached?.Invoke();
+                    Invoke(nameof(GetNewPath), 0.01f);
+                }
+                isMoving = false;
+                return;
+            }
+            if (currentPath == null || currentPath.length == 0 || currentWaypoint < 0 || currentWaypoint >= currentPath.length)
+            {
+                forceNewPath = true;
+                isPreloadingNextPath = false;
+                isMoving = false;
+                reachedDestination = true;
+                return;
+            }
+            if (enableDynamicRepathing && nextGoal.HasValue)
+            {
+                int remaining =  currentAStarPath.Count - 1 - GetCurrentRawIndex();
+                if (!isPreloadingNextPath && remaining < nodesAwayBeforeRepath && !straightPath && isMoving && !forceNewPath)
+                {
+                    PreloadAndMergePath();
+                    isPreloadingNextPath = true;
+                }
+            }
+
+            Vector3 directionVector = nextWaypointPosition - transform.position;
+            Vector3 desiredDir = directionVector.normalized;
+
+            // Calculate turn angle and turn speed modifier
+            float angle = Vector3.Angle(lastForward, desiredDir);
+
+            // Handle case where lastForward might be zero
+            if (lastForward.magnitude < 0.001f)
+            {
+                lastForward = transform.forward;
+                angle = Vector3.Angle(lastForward, desiredDir);
+            }
+
+            // Calculate how much the agent can actually turn this frame
+            float maxTurnThisFrame = turnSpeed * Time.fixedDeltaTime;
+            float actualTurnAngle = Mathf.Min(angle, maxTurnThisFrame);
+
+            // Handle slopes
+            if (walking && isOnGround)
+            {
+                RaycastHit hit;
+                if (Physics.Raycast(transform.position, Vector3.down, out hit, groundCheckDistance * 2f))
+                {
+                    float slopeAngle = Vector3.Angle(hit.normal, Vector3.up);
+                    if (slopeAngle > maxSlopeAngle)
+                    {
+                        // Project movement direction onto slope plane
+                        Vector3 projectedDir = Vector3.ProjectOnPlane(desiredDir, hit.normal);
+                        if (projectedDir.magnitude > 0.001f)
+                        {
+                            desiredDir = projectedDir.normalized;
+                            //finalSpeed *= Mathf.Clamp01(1 - (slopeAngle - maxSlopeAngle) / (90f - maxSlopeAngle));
+                        }
+                        else
+                        {
+                            // If projection results in zero vector, stop movement
+                            ApplyStoppingForce();
+                            return;
+                        }
+                    }
+                }
+            }
+
+            // Calculate movement direction based on turn speed constraints
+            Vector3 movementDir;
+            if (angle > maxTurnThisFrame && angle > 0.001f)
+            {
+                // If we can't turn fast enough, move in the direction we can actually face
+                movementDir = Vector3.Slerp(lastForward, desiredDir, actualTurnAngle / angle);
+            }
+            else
+            {
+                movementDir = desiredDir;
+            }
+
+            // Validate movementDir
+            if (float.IsNaN(movementDir.x) || float.IsNaN(movementDir.y) || float.IsNaN(movementDir.z))
+            {
+                Debug.LogWarning("movementDir is NaN, using desiredDir");
+                movementDir = desiredDir;
+            }
+
+            // Calculate movement
+            Vector3 targetVelocity = movementDir * maxSpeed;
+
+            // Validate targetVelocity
+            if (float.IsNaN(targetVelocity.x) || float.IsNaN(targetVelocity.y) || float.IsNaN(targetVelocity.z))
+            {
+                Debug.LogWarning("targetVelocity is NaN, stopping movement");
+                return;
+            }
+
+            isMoving = true;
+
+            Vector3 difference = targetVelocity - currentVelocity;
+            currentVelocity += difference * (Time.fixedDeltaTime * acceleration);
+
+            // Final validation of currentVelocity
+            if (float.IsNaN(currentVelocity.x) || float.IsNaN(currentVelocity.y) || float.IsNaN(currentVelocity.z))
+            {
+                Debug.LogWarning("currentVelocity is NaN, resetting to zero");
+                currentVelocity = Vector3.zero;
+            }
+
+            // Apply movement
+            if (walking && isOnGround)
+            {
+                rb.linearVelocity = new Vector3(currentVelocity.x, rb.linearVelocity.y, currentVelocity.z);
+            }
+            else
+            {
+                rb.linearVelocity = currentVelocity;
+            }
+            // Handle rotation with turn speed limit
+            if (desiredDir != Vector3.zero && desiredDir.magnitude > 0.001f)
+            {
+                Vector3 newForward;
+                if (angle > maxTurnThisFrame && angle > 0.001f)
+                {
+                    // Limit rotation to turnSpeed - turn as much as possible this frame
+                    newForward = Vector3.Slerp(lastForward, desiredDir, maxTurnThisFrame / angle);
                 }
                 else
                 {
-                    Vector3 direction = (targetPosition - previousPos).normalized;
-                    Ray r = new Ray(previousPos, direction);
-                    if (shrunk.IntersectRay(r, out float dist))
+                    // Can complete the turn this frame
+                    newForward = desiredDir;
+                }
+                if (controlRotation) { 
+                    // Validate newForward
+                    if (!float.IsNaN(newForward.x) && !float.IsNaN(newForward.y) && !float.IsNaN(newForward.z) && newForward.magnitude > 0.001f)
                     {
-                        waypoint = r.GetPoint(dist);
-                    }
-                    else
-                    {
-                        waypoint = shrunk.ClosestPoint(targetPosition);
+                        Quaternion targetRotation = Quaternion.LookRotation(newForward, Vector3.up);
+
+                        if (stayUpright)
+                        {
+                            // Keep rotation upright by locking X and Z axes
+                            Vector3 euler = targetRotation.eulerAngles;
+                            euler.x =    0f;
+                            euler.z = 0f;
+                            targetRotation = Quaternion.Euler(euler);
+                        }
+
+                        rb.MoveRotation(targetRotation);
+                        lastForward = newForward;
                     }
                 }
-
-                path.Add(waypoint);
-                previousPos = waypoint;
             }
-
-            path.Add(targetPosition);
-            return path;
         }
 
-        private void PathToTarget()
+        private float PathDistance()
         {
-            if (target == null || OctNavigation.graph == null || OctNavigation.graph.nodes.Count == 0)
+            if (currentPath == null || currentPath.length == 0 || currentWaypoint >= currentPath.length)
+                return 0;
+
+            Vector3 currentPos = transform.position;
+            return currentPath.ClosestDistanceToPoint(currentPos);
+        }
+        private int FindBestNextWaypoint()
+        {
+            /*
+             the best next waypoint probably should account for speed
+             */
+            
+           float minDistance = float.MaxValue;
+           int bestIndex = -1;
+
+           for (int i = currentWaypoint-1; i < currentPath.length; i++)
+           {
+               float dist = Vector3.Distance(transform.position, currentPath[i]);
+               if (dist < minDistance)
+               {
+                   minDistance = dist;
+                   bestIndex = i;
+               }
+           }
+
+            return bestIndex+1;
+       }
+
+       private void GroundCheck()
+       {
+           isOnGround = Physics.Raycast(transform.position, Vector3.down, groundCheckDistance);
+       }
+
+       public void ApplyStoppingForce()
+       {
+
+           if (walking && isOnGround)
+           {
+               rb.linearVelocity = new Vector3(
+                   Mathf.Lerp(rb.linearVelocity.x, 0f, deceleration * Time.fixedDeltaTime),
+                   rb.linearVelocity.y,
+                   Mathf.Lerp(rb.linearVelocity.z, 0f, deceleration * Time.fixedDeltaTime)
+               );
+           }
+           else
+           {
+                
+                rb.linearVelocity = Vector3.Lerp(rb.linearVelocity, Vector3.zero, deceleration * Time.fixedDeltaTime);
+           }
+       }
+
+       public int GetAStarPathLength() => currentAStarPath?.Count ?? 0;
+
+       public OctNode GetPathNode(int index)
+       {
+           if (index < 0 || index >= currentAStarPath.Count)
+           {
+               Debug.LogError($"Index out of bounds. Path length: {currentAStarPath.Count}, Index: {index}");
+               return null;
+           }
+           return currentAStarPath[index].octreeNode;
+       }
+
+       private void GetNewPath()
+       {
+           reachedDestination = false;
+           currentNode = OctNavigation.GetGraph(walking).GetClosestNode(transform.position);
+           if (currentGoal.HasValue)
+           {
+                currentWaypoint = 0;
+                PathToPoint(currentGoal.Value);
+                targetCachedPosition = currentGoal.Value;
+           }
+           else
+           {
+               Debug.LogAssertion("Target has not been assigned to the agent: " + gameObject.name);
+           }
+        }
+        public void SetDestination(Vector3 point)
+        {
+            straightPath = false;
+            manualDestination = point;
+            target = null;
+            isPaused = false;
+            isMoving = true;
+            ForceRepath();
+        }
+
+        public void SetTarget(Transform newTarget = null)
+        {
+            straightPath = false;
+            if (newTarget != null) target = newTarget;
+            forceNewPath = false;
+            Graph currentGraph = OctNavigation.GetGraph(walking);
+            if (target == null || currentGraph == null || currentGraph.nodes.Count == 0)
             {
                 Debug.LogError("Target or graph is null.");
-                hasValidPath = false;
+                Stop();
+                return;
+            }
+            manualDestination = null;
+            isPaused = false;
+            isMoving = true;
+            ForceRepath();
+        }
+        public void SetDestinationStraight(Vector3? point = null)
+        {
+          
+            Vector3? dest = point ?? currentGoal ?? null;
+            if (!dest.HasValue) return;
+            straightPath = true;
+            manualDestination = dest;
+            target = null;
+            isPaused = false;
+            isMoving = true;
+            ForceRepath();
+        }
+
+        public void PathToPoint(Vector3 goalPosition)
+        {
+            forceNewPath = false;
+            if (straightPath)
+            {
+                currentPath = BuildStraightPath(goalPosition);
                 return;
             }
 
-            currentNode = OctNavigation.graph.GetClosestNode(transform.position);
-            OctNode targetNode = OctNavigation.graph.GetClosestNode(target.position);
+            Graph currentGraph = OctNavigation.GetGraph(walking);
+            if (currentGraph == null || currentGraph.nodes.Count == 0)
+            {
+                Debug.LogError("graph is null.");
+                return;
+            }
+
+            targetCachedPosition = goalPosition;
+
+            currentNode = currentGraph.GetClosestNode(transform.position);
+            OctNode targetNode = currentGraph.GetClosestNode(currentGoal.Value);
 
             if (currentNode == targetNode)
             {
-                currentAStarPath = new List<Node> { OctNavigation.graph.FindNode(currentNode) };
+                currentAStarPath = new List<Node> { currentGraph.FindNode(currentNode) };
                 currentPath.Clear();
-                currentPath.Add(target.position);
+                currentPath.Add(goalPosition);
                 currentWaypoint = 0;
-                hasValidPath = true;
                 return;
             }
-
-            currentAStarPath = OctNavigation.graph.AStar(currentNode, targetNode, groundOnly, maxStepHeight);
-            if (currentAStarPath == null)
+            float startTime = Time.realtimeSinceStartup;
+            currentAStarPath = currentGraph.AStar(currentNode, targetNode, heuristicType);
+            float endTime = Time.realtimeSinceStartup;
+            if (walking)
             {
-                Debug.LogWarning("PathToTarget failed: no valid path found.");
-                hasValidPath = false;
+                List<Node> pathToUse = currentAStarPath;
+                // first node is always fine 
+                List<Node> truncated = new List<Node> { currentAStarPath[0] };
+                float lastY = currentAStarPath[0].center.y;
+                for (int i = 1; i < currentAStarPath.Count; i++)
+                {
+                    float thisY = currentAStarPath[i].center.y;
+
+                    if (thisY - lastY > maxStepDistance)
+                    {
+                        break;
+                    }
+                    truncated.Add(currentAStarPath[i]);
+                    lastY = thisY;
+                }
+                pathToUse = truncated;
+                currentAStarPath = pathToUse;
+            }
+            if (currentAStarPath == null || currentAStarPath.Count == 0)
+            {
+                Debug.LogWarning("No path found in PathToTarget");
+                isPreloadingNextPath = false;
                 forceNewPath = true;
                 return;
             }
 
-            currentWaypoint = 0;
-            hasValidPath = true;
-            currentPath = BuildSmoothedPath(currentAStarPath);
+            bool reachedTarget = currentAStarPath.Last().octreeNode == targetNode;
+            Vector3 finalPoint = reachedTarget ? goalPosition : currentAStarPath.Last().center;
 
-            //string s = "A* leaf centers: ";
-            //for (int i = 0; i < currentAStarPath.Count; i++)
-            //{
-            //    Vector3 c = currentAStarPath[i].octreeNode.bounds.center;
-            //    s += $"({c.x:F1},{c.y:F1},{c.z:F1}) ";
-            //}
-            //Debug.Log(s);
-        }
-        List<List<Vector3>> portals;
-        public AgentPath BuildSmoothedPath(List<Node> rawPath)
-        {
-            AgentPath path = new AgentPath();
-            if (rawPath == null || rawPath.Count < 2)
+            currentWaypoint = 0;
+            if (enableSmoothing)
             {
-                if (rawPath != null)
-                    foreach (var n in rawPath)
-                        path.Add(n.octreeNode.bounds.center);
+                if (enableRaycastSmoothing)
+                {
+                    
+                    currentPath = BuildSmoothedPathPhysics(currentAStarPath, finalPoint);
+                }
+                else
+                {
+                    currentPath = BuildSmoothedPath(currentAStarPath, finalPoint);
+
+                }
+            }
+            else
+            {
+                currentPath = new AgentPath();
+                foreach (Node node in currentAStarPath)
+                {
+                    currentPath.Add(node.center);
+                }
+            }
+        }
+        public void Stop()
+        {
+            isMoving = false;
+            isPaused = false;
+            straightPath = false;
+            ClearPath();
+            ZeroVelocity();
+            
+        }
+        public void Pause()
+        {
+            if (!isMoving) return;
+            isPaused = true;
+            cashedVelocity = currentVelocity;
+            cashedAngularVelocity = rb.angularVelocity;
+            rotationFrozen = true;
+            ZeroVelocity();
+        }
+
+        public void Resume()
+        {
+            if (!isPaused) return;
+            isPaused = false;
+            currentVelocity = cashedVelocity;
+            rb.angularVelocity = cashedAngularVelocity;
+            rotationFrozen = false;
+            if (rb != null) rb.linearVelocity = cashedVelocity;
+        }
+        public class PathSubscription : IDisposable
+        {
+            readonly OctreeNavigationAgent youtuberAgent;
+            readonly Action notificationBell;
+            public event Action OnReached;
+
+            internal PathSubscription(OctreeNavigationAgent agent)
+            {
+                youtuberAgent = agent;
+                notificationBell = () =>
+                {
+                    OnReached?.Invoke();
+                };
+                youtuberAgent.OnDestinationReached += notificationBell;
+            }
+
+            public void Dispose()
+            {
+                youtuberAgent.OnDestinationReached -= notificationBell;
+            }
+        }
+        public PathSubscription BeginMovement()
+        {
+            if (!currentGoal.HasValue)
+            {
+                Debug.LogWarning("Nno target or destination set");
+                return null;
+            }
+            rotationFrozen = false;
+            isPaused = false;
+            isMoving = true;
+            ForceRepath();
+            return new PathSubscription(this);
+        }
+        private void ClearPath()
+        {
+            currentPath.Clear();
+            currentAStarPath.Clear();
+            viaPoints.Clear();
+            portals.Clear();
+            currentWaypoint = 0;
+        }
+        private void ZeroVelocity()
+        {
+            currentVelocity = Vector3.zero;
+            if (rb != null)
+            {
+                rb.linearVelocity = Vector3.zero;
+                rb.angularVelocity = Vector3.zero;
+            }
+        }
+     
+        private void ForceRepath()
+        {
+            ClearPath();
+            forceNewPath = true;
+            isPreloadingNextPath = false;
+            GetNewPath();
+            OnPathUpdated?.Invoke(currentPath.waypoints);
+        }
+     
+        public void ResetPath()
+        {
+            currentPath = new AgentPath();
+            currentAStarPath =  new List<Node>();
+        }
+        public AgentPath BuildSmoothedPath(List<Node> rawPath, Vector3 finalTarget, float? circleRadius = null)
+        {
+            portals = ExtractPortals(rawPath);
+
+            viaPoints = new List<Vector3>() ;
+            for(int i = 0; i < portals.Count; i++)
+            {
+                List<Vector3> portal = portals[i];
+
+                Vector3 from = (i == 0) ? transform.position : currentAStarPath[i].center;
+                Vector3 to = (i == portals.Count - 1) ? finalTarget : currentAStarPath[i + 1].center;
+
+                Vector3 normal = Vector3.Cross(portal[1] - portal[0], portal[2] - portal[1]).normalized;
+                Plane portalPlane = new Plane(normal, portal[0]);
+
+                Vector3 travelDir = (to - from).normalized;
+                Vector3 intersection;
+
+                if (portalPlane.Raycast(new Ray(from, travelDir), out float hitDist))
+                {
+                    intersection = from + travelDir * hitDist;
+                }
+                else
+                {
+                    intersection = portal.Aggregate(Vector3.zero, (acc, p) => acc + p) / portal.Count;
+                }
+
+                Bounds portalBounds = new Bounds(portal[0], Vector3.zero);
+                foreach (Vector3 p in portal) portalBounds.Encapsulate(p);
+                Vector3 clamped = portalBounds.ClosestPoint(intersection);
+
+                viaPoints.Add(clamped);
+            }
+
+            viaPoints.Add(finalTarget);
+            AgentPath path = SplineThrough(viaPoints, splineSubdivisionCount);
+
+            if (path.length > 1 && Vector3.Distance(path[0], transform.position) < Mathf.Epsilon)
+            {
+                path.waypoints.RemoveAt(0);
+            }
+
+            if (walking)
+            {
+                for (int i = 0; i < path.length; i++)
+                {
+                    float t = (path.length == 1) ? 0f : (float)i / (path.length - 1);
+                    int rawIndex = Mathf.Clamp(Mathf.RoundToInt(t * (rawPath.Count - 1)), 0, rawPath.Count - 1);
+
+                    float rawY = rawPath[rawIndex].octreeNode.bounds.center.y + rawPath[rawIndex].octreeNode.bounds.extents.y;
+
+                    path.waypoints[i] = new Vector3(path.waypoints[i].x, rawY, path.waypoints[i].z);
+                }
+            }
+
+            return path;
+        }
+        public AgentPath BuildSmoothedPathPhysics(List<Node> rawPath, Vector3 finalTarget, int subdivs = 8)
+        {
+            if (walking)
+            {
+                return BuildSmoothedPath(rawPath, finalTarget);
+            }
+            List<Vector3> points = new List<Vector3>() { transform.position };
+            AgentPath path = new AgentPath();
+            points.AddRange(rawPath.Select(n => n.center).ToList());
+            points.Add(finalTarget);
+
+            if(points.Count < 2)
+            {
+                foreach(Vector3 p in points)
+                {
+                    path.Add(p);
+                }
                 return path;
             }
 
-            List<Vector3> centers = rawPath.Select(n => n.octreeNode.bounds.center).ToList();
-            portals = ExtractPortals(rawPath);
-            return Funnel3DPath(centers, portals);
-        }
-
-        public AgentPath Funnel3DPath(List<Vector3> pathPoints, List<List<Vector3>> portals)
-        {
-            AgentPath path = new AgentPath();
-            path.Add(pathPoints[0]); // Start at the first node center
-
-            Vector3 apex = pathPoints[0];
-            Vector3 left = apex;
-            Vector3 right = apex;
-            int apexIndex = 0;
-            int leftIndex = 0;
-            int rightIndex = 0;
-
-            for (int i = 0; i < portals.Count; i++)
+            viaPoints = new List<Vector3>() { points[0] };
+            int i = 0;
+            while (i < points.Count - 1)
             {
-                var (newLeft, newRight) = GetPortalEdge(apex, portals[i]);
+                int best = i +1;
 
-                // tighten right
-                if (IsLeftOf(apex, right, newRight))
+                for (int j = points.Count - 1; j > best; j--)
                 {
-                    right = newRight;
-                    rightIndex = i + 1;
+                    float raySize = Vector3.Distance(points[i], points[j]);
+                    
+                    if (!Physics.SphereCast(points[i], agentRadius , (points[j] - points[i]), out RaycastHit hit, raySize, layerMask))
+                    {
+                        //Debug.DrawRay(points[i], (points[j] - points[i]).normalized * raySize, OctColour.SpringGreen.Color(), 30f);
+                        //OctUtils.DrawBounds2D(new Bounds(points[j], Vector3.one * 5f), OctColour.SpringGreen.Color());
+                        best = j;
+                        break;
+                    }
+                    else { 
+                        //Debug.DrawRay(points[i], (points[j] - points[i]).normalized * raySize, Color.red, 30f);
+                        //OctUtils.DrawBounds2D(new Bounds(points[j], Vector3.one * 5f), OctColour.Crimson.Color());
+                    }
                 }
-                else
-                {
-                    // funnel collapsed on right
-                    path.Add(left);
-                    apex = left;
-                    apexIndex = leftIndex;
-                    i = apexIndex;
-                    left = apex;
-                    right = apex;
-                    leftIndex = apexIndex;
-                    rightIndex = apexIndex;
-                    continue;
-                }
+                viaPoints.Add(points[best]);
+                i = best;
 
-                // tighten left
-                if (IsRightOf(apex, left, newLeft))
+            }
+           
+            for (int k = 0; k < viaPoints.Count-1; k++)
+            {
+                Vector3 p0 = (k == 0) ? viaPoints[0] : viaPoints[k - 1];
+                Vector3 p1 = viaPoints[k];
+                Vector3 p2 = viaPoints[k + 1];
+                Vector3 p3 = (k+2 < viaPoints.Count) ? viaPoints[k + 2] : viaPoints[^1];
+
+                for(int step = 0; step < subdivs; step++)
                 {
-                    left = newLeft;
-                    leftIndex = i + 1;
-                }
-                else
-                {
-                    // funnel collapsed on left
-                    path.Add(right);
-                    apex = right;
-                    apexIndex = rightIndex;
-                    i = apexIndex;
-                    left = apex;
-                    right = apex;
-                    leftIndex = apexIndex;
-                    rightIndex = apexIndex;
-                    continue;
+                    float t = step / (float)subdivs;
+                    Vector3 point = CatmullRom(p0, p1, p2, p3, t);
+                    path.Add(point);
                 }
             }
+            path.Add(viaPoints[^1]);
+            if (path.length > 1 && Vector3.Distance(path[0], transform.position) < Mathf.Epsilon)
+            {
+                path.waypoints.RemoveAt(0);
+            }
 
-            // Add final point
-            path.Add(pathPoints[^1]);
+            return path;
+
+        }
+        public AgentPath BuildStraightPath(Vector3? target = null)
+        {
+            AgentPath path = new AgentPath();
+            Vector3 start = transform.position;
+            path.Add(start);
+            Vector3? end = target ?? currentGoal ?? null;
+            if(!end.HasValue)
+            {
+                // no path will just have one node
+                return path;
+            }
+            if (Physics.Raycast(start, (end.Value - start).normalized, out RaycastHit hit, Vector3.Distance(start, end.Value),layerMask))
+            {
+                path.Add(hit.point);
+            }
+            else
+            { 
+                path.Add(end.Value);
+            }
+            
             return path;
         }
 
-        private (Vector3 left, Vector3 right) GetPortalEdge(Vector3 apex, List<Vector3> quad)
+        private void PreloadAndMergePath()
         {
-            // Find horizontal (XZ) apex & portal center
-            Vector3 apexXZ = new Vector3(apex.x, 0, apex.z);
-
-            // If quad[0] and quad[2] are opposite corners, their average is the true center.
-            Vector3 center3D = (quad[0] + quad[2]) * 0.5f;
-            Vector3 centerXZ = new Vector3(center3D.x, 0, center3D.z);
-
-            // Compute funnel‐axis direction in XZ
-            Vector3 forwardDirXZ = (centerXZ - apexXZ).normalized;
-            if (forwardDirXZ == Vector3.zero)
+            Debug.Log("dynamic repath");
+            Graph graph = OctNavigation.GetGraph(walking);
+            OctNode startOct = graph.GetClosestNode(transform.position);
+            OctNode endOct = graph.GetClosestNode(nextGoal.Value);
+            List<Node> newRaw = graph.AStar(startOct, endOct, heuristicType);
+            if (newRaw == null || newRaw.Count == 0)
             {
-                // If apex is exactly at center, pick any direction (arbitrary)
-                forwardDirXZ = Vector3.forward;
+                forceNewPath = true;
+                isPreloadingNextPath = false;
+                return;
             }
 
-            // Define a 2D “right” axis in XZ (perp to forwardDirXZ)
-            Vector3 rightAxis = Vector3.Cross(Vector3.up, forwardDirXZ).normalized;
-            // This rightAxis lies in XZ-plane, perpendicular to forwardDirXZ.
+            List<Node> remainingOldPath = currentAStarPath.Skip(Mathf.Clamp(GetCurrentRawIndex(), 0, currentAStarPath.Count - 1)).ToList();
 
-            // For each of the 4 corners, project to XZ and compute dot with rightAxis:
-            float minDot = float.PositiveInfinity;
-            float maxDot = float.NegativeInfinity;
-            Vector3 leftCorner = quad[0];
-            Vector3 rightCorner = quad[0];
-
-            foreach (Vector3 corner in quad)
+            if (remainingOldPath.Count > 0 && remainingOldPath.Last().Equals(newRaw[0]))
             {
-                Vector3 cornerXZ = new Vector3(corner.x, 0, corner.z);
-                float d = Vector3.Dot(cornerXZ - apexXZ, rightAxis);
-
-                if (d < minDot)
-                {
-                    minDot = d;
-                    leftCorner = corner;
-                }
-                if (d > maxDot)
-                {
-                    maxDot = d;
-                    rightCorner = corner;
-                }
+                newRaw.RemoveAt(0);
             }
 
-            return (leftCorner, rightCorner);
-        }
+            currentAStarPath = remainingOldPath.Concat(newRaw).ToList();
 
-        bool IsLeftOf(Vector3 apex, Vector3 edge, Vector3 test)
-        {
-            Vector3 a = edge - apex;
-            Vector3 b = test - apex;
-            return Vector3.Cross(a, b).y >= 0; // adjust axis if needed
-        }
 
-        bool IsRightOf(Vector3 apex, Vector3 edge, Vector3 test)
-        {
-            Vector3 a = edge - apex;
-            Vector3 b = test - apex;
-            return Vector3.Cross(a, b).y <= 0; // adjust axis if needed
-        }
-        public List<List<Vector3>> ExtractPortals(List<Node> path)
-        {
-            List<List<Vector3>> portals = new();
+            Vector3 finalPoint = (newRaw.Last().octreeNode == endOct)
+                                 ? currentGoal.Value
+                                 : newRaw.Last().center;
 
-            for (int i = 0; i < path.Count - 1; i++)
+            if (enableSmoothing)
             {
-                var a = path[i].octreeNode.bounds;
-                var b = path[i + 1].octreeNode.bounds;
-                var portal = GetTouchingPortal(a, b);
+                if (enableRaycastSmoothing)
+                {
 
-                if (portal != null && portal.Count == 4)
-                    portals.Add(portal);
+                    currentPath = BuildSmoothedPathPhysics(currentAStarPath, finalPoint);
+                }
                 else
-                    Debug.LogWarning($"Could not compute portal between node {i} and {i + 1}");
+                {
+                    currentPath = BuildSmoothedPath(currentAStarPath, finalPoint);
+
+                }
             }
+            else
+            {
+                currentPath = new AgentPath();
+                foreach (Node node in currentAStarPath)
+                {
+                    currentPath.Add(node.center);
+                }
+            }
+            nextGoal = null;
+            currentWaypoint = 0;
+            OnPathUpdated?.Invoke(currentPath.waypoints);
+            isPreloadingNextPath = false;
+        }
+        private int GetCurrentRawIndex()
+        {
+            if (currentAStarPath == null || currentAStarPath.Count == 0) return 0;
+
+            Vector3 probe = (currentWaypoint < currentPath.length) ? currentPath[currentWaypoint] : transform.position;
+
+            float bestDist = float.MaxValue;
+            int bestIndex = 0;
+
+            for (int i = 0; i < currentAStarPath.Count; i++)
+            {
+                // scuffed but should be close enough
+                float dist = Vector3.Distance(probe, currentAStarPath[i].center);
+                if (dist < bestDist)
+                {
+                    bestDist = dist;
+                    bestIndex = i;
+                }
+            }
+
+            return bestIndex;
+        }
+        private AgentPath SplineThrough(List<Vector3> pts, int subdivs = 8, Vector3? circleCenter = null)
+        {
+           AgentPath path = new AgentPath();
+           if (pts.Count < 2)
+           {
+               foreach (Vector3 p in pts) path.Add(p);
+               return path;
+           }
+
+           // get ghost points
+           Vector3 Get(int i)
+           {
+               if (i < 0) return pts[0];
+               else if (i >= pts.Count) return pts[^1];
+               else return pts[i];
+           }
+
+           // build segments
+           for (int i = 0; i < pts.Count - 1; i++)
+           {
+               Vector3 p0 = Get(i - 1);
+               Vector3 p1 = Get(i);
+               Vector3 p2 = Get(i + 1);
+               Vector3 p3 = Get(i + 2);
+
+/*              if (i == pts.Count - 2 && circleCenter.HasValue)
+                {
+                    p3 = ComputeGhostPoint(p1, p2, circleCenter.Value);
+                }
+                else
+                {
+                   
+                }*/
+
+                for (int step = 0; step < subdivs; step++)
+               {
+                   float t = step / (float)subdivs;
+                   Vector3 point = CatmullRom(p0,p1,p2,p3,t);
+                   path.Add(point);
+               }
+           }
+           path.Add(pts[^1]);
+           return path;
+       }
+
+        //circle around target instead of going straight to it
+        private Vector3 ComputeGhostPoint(Vector3 prev, Vector3 last, Vector3 center) 
+        {
+            float delta = Vector3.Distance(last, prev);
+
+            Vector3 R = last - center;
+            R.y = 0;
+
+            R.Normalize();
+
+            Vector3 T = Vector3.Cross(Vector3.up, R).normalized;
+
+            return last + T * delta;
+        }
+
+        public static Vector3 CatmullRom(Vector3 p0, Vector3 p1, Vector3 p2, Vector3 p3, float t)
+        {
+            return 0.5f * (
+                2f * p1 +
+                (-p0 + p2) * t +
+                (2f * p0 - 5f * p1 + 4f * p2 - p3) * t * t +
+                (-p0 + 3f * p1 - 3f * p2 + p3) * t * t * t
+            );
+        }
+
+        public List<List<Vector3>> ExtractPortals(List<Node> path)
+       {
+           List<List<Vector3>> portals = new();
+
+           for (int i = 0; i < path.Count - 1; i++)
+           {
+               Bounds a = path[i].bounds;
+               Bounds b = path[i + 1].bounds;
+               List<Vector3> portal = GetTouchingPortal(a, b);
+
+               if (portal != null && portal.Count == 4)
+               {
+                   portals.Add(portal); 
+               }
+              /* else
+                   Debug.LogWarning($"Could not compute portal between node {i} and {i + 1}");*/
+        }
 
             return portals;
         }
@@ -555,90 +1148,60 @@ namespace OctNav
             return quad;
         }
 
-
-        void GetRandomDestination()
-        {/*
-            if (OctNavigation.graph.nodes.Count == 0)
-            {
-                Debug.LogWarning("No nodes available in graph.");
-                return;
-            }
-
-            currentNode = OctNavigation.graph.GetClosestNode(transform.position);
-            OctNode destinationNode;
-            int tries = 0, maxTries = 20;
-
-            do
-            {
-                destinationNode = OctNavigation.graph.nodes.ElementAt(Random.Range(0, OctNavigation.graph.nodes.Count)).Key;
-                currentAStarPath = OctNavigation.graph.AStar(currentNode, destinationNode, groundOnly, maxStepHeight);
-                if (currentAStarPath != null)
-                {
-                    currentWaypoint = 0;
-                    hasValidPath = true;
-                    currentPath = currentPath = useLookAhead ? BuildLookaheadPath(currentAStarPath, target.position) :
-                OctPathSmoothing.BuildSmoothedPath(
-                currentAStarPath,
-                transform.position,
-                target.position,
-                agentRadius,
-                maxSmoothingSteps
-            );
-                    return;
-                }
-                tries++;
-            }
-            while (tries < maxTries);
-
-            Debug.LogWarning("GetRandomDestination failed: no path found after multiple attempts.");
-            hasValidPath = false;
-            forceNewPath = true;
-
-
-            currentPath.Clear();
-            for (int i = 0; i < currentAStarPath.Count - 1; i++)
-            {
-                Vector3 p1 = currentAStarPath[i].octreeNode.bounds.center;
-                Vector3 p2 = currentAStarPath[i + 1].octreeNode.bounds.center;
-                Vector3 dir = (p2 - p1).normalized;
-                Vector3 offset = Vector3.Scale(dir, currentAStarPath[i].octreeNode.bounds.extents * 0.5f);
-                currentPath.Add(p1 + offset);
-            }
-            // Add final point
-            currentPath.Add(currentAStarPath[^1].octreeNode.bounds.center);*/
-        }
-
-        private void OnDrawGizmos()
+        private void OnDrawGizmosSelected()
         {
-            if (OctNavigation.graph == null || GetPathLength() == 0) return;
+            Gizmos.color = OctColour.Chartreuse.Color();
+            Gizmos.DrawWireSphere(transform.position, accuracy);
+            if (OctNavigation.GetGraph(walking) != null && GetAStarPathLength() > 0){
 
-            Gizmos.color = Color.red;
-            Gizmos.DrawWireSphere(GetPathNode(0).bounds.center, 0.7f);
+            
 
-            Gizmos.color = Color.blue;
-            Gizmos.DrawWireSphere(GetPathNode(GetPathLength() - 1).bounds.center, 0.7f);
-
-            for (int i = 0; i < GetPathLength(); i++)
-            {
-                Gizmos.DrawWireSphere(GetPathNode(i).bounds.center, 0.5f);
-                if (i < GetPathLength() - 1)
-                {   
-                    Gizmos.DrawLine(GetPathNode(i).bounds.center, GetPathNode(i + 1).bounds.center);
+                Gizmos.color = Color.blue;
+                for (int i = 0; i < GetAStarPathLength(); i++)
+                {
+                    Gizmos.DrawWireSphere(GetPathNode(i).bounds.center, 0.5f);
+                    if (i < GetAStarPathLength() - 1)
+                    {   
+                        Gizmos.DrawLine(GetPathNode(i).bounds.center, GetPathNode(i + 1).bounds.center);
+                    }
                 }
-            }
+                Gizmos.color = OctColour.Teal.Color();
+                Gizmos.DrawWireSphere(GetPathNode(0).bounds.center, 2f);
 
-            if (target != null)
+                Gizmos.color = Color.red;
+                Gizmos.DrawWireSphere(GetPathNode(GetAStarPathLength() - 1).bounds.center, 2f);
+            }
+            if (currentGoal != null)
             {
                 Gizmos.color = Color.magenta;
-                Gizmos.DrawLine(transform.position, target.position);
+                Gizmos.DrawLine(transform.position, currentGoal.Value);
+            }
+            if (viaPoints != null)
+            {
+                Gizmos.color = Color.cyan;
+                foreach (Vector3 p in viaPoints)
+                {
+                    Gizmos.DrawSphere(p, 0.7f);
+                }
             }
 
-          
             if (currentPath.length > 0)
             {
-                Gizmos.color = Color.yellow;
+               
                 for (int i = 0; i < currentPath.length; i++)
                 {
+                    if(i == currentPath.length - 1)
+                    {
+                        Gizmos.color = Color.red;
+                    }
+                    else if (i == currentWaypoint)
+                    {
+                        Gizmos.color = Color.green;
+                    }
+                    else
+                    {
+                        Gizmos.color = Color.white;
+                    }
                     Vector3 wp = currentPath[i];
                     Gizmos.DrawSphere(wp, 0.15f);
 
@@ -649,8 +1212,17 @@ namespace OctNav
                     }
                 }
             }
-         
+            if (OctNavigation.GetGraph(walking) == null) return;
+            foreach (List<Vector3> p in portals)
+            {
+                for (int i = 0; i < 4; i++)
+                {
+                    Gizmos.color = Color.magenta;
+                    Gizmos.DrawLine(p[i], p[(i + 1) % 4]);
+                }
+            }
         }
 
+ 
     }
 }

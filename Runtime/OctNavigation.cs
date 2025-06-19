@@ -5,9 +5,12 @@ namespace OctNav
     public static class OctNavigation
     {
         public static Graph graph = new Graph();
-        private static Graph tempGraph = new Graph();
+        public static Graph groundGraph = new Graph();
 
-        // functions for user to build small sections of navigational space
+        public static Graph GetGraph(bool grounded = false)
+        {
+            return grounded ? groundGraph : graph;
+        }
         public static void BuildNavigation(Vector3 position, Vector3 extent)
         {
             Bounds buildBounds = new Bounds(position, extent);
@@ -42,18 +45,14 @@ namespace OctNav
             }
         }
 
-        private static void TryReloadOctreeVolumes()
+        public static void TryReloadOctreeVolumes()
         {
             OctVolume[] octVolumes = Object.FindObjectsByType<OctVolume>(FindObjectsSortMode.None);
             foreach (OctVolume volume in octVolumes)
             {
                 if (volume != null)
                 {
-                    Debug.Log($"[OctNavigation] Reloading Octree for: {volume.name}");
-                    if (!volume.LoadOctree())
-                    {
-                        Debug.LogError("Error loading octree data");
-                    }
+                    volume.LoadOctree();
                 }
             }
         }

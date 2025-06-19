@@ -20,7 +20,7 @@ namespace OctNav
             EditorGUILayout.Space();
             if(GUILayout.Button("Reset"))
             {
-                boundRef.Reset();
+                boundRef.ResetOctree();
             }
             EditorGUILayout.Space();
        
@@ -38,7 +38,7 @@ namespace OctNav
             OctVolume[] volumes = Resources.FindObjectsOfTypeAll<OctVolume>();
             foreach (OctVolume vol in volumes)
             {
-                vol.Reset();
+                vol.ResetOctree();
             }
         }
     }
