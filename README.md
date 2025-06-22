@@ -7,7 +7,12 @@
 
 # Octree Navigation
 
-Install from package manager in Unity with `https://github.com/TheosCreation/OctNav.git`
+Octree Navigation allows you to create ai agents that can be airborne or ground-based based all at runtime and using little resources to run. Our package makes use of a Sparse Voxel Octree, which subdivides the space if obstacles are within that cube and will keep subdividing until it reaches a quality suitable for the user. The package has an ai navigation system built on top of the Sparse Voxel Octree, allowing it to make airborne navigation agents that use A* pathfinding to navigate the space.
+
+# How to install
+Install from the package manager in Unity with `https://github.com/TheosCreation/OctNav.git`
+
+# How to use
 
 ## OctAgent Class Example
 
@@ -267,15 +272,6 @@ public void UpdateVolume()
 
 ```
 
-
-
-
-
-
-# Octree Navigation
-
-Install from package manager in Unity with [https://github.com/TheosCreation/OctNav.git](https://github.com/TheosCreation/OctNav.git)
-
 ## OctBuilder Class Example
 
 Here is an example of how to use the `OctBuilder` component to build a navigation graph:
@@ -329,11 +325,6 @@ Triggers the navigation graph build process using the bounds defined by the atta
     
     ```
 
-
-
-# Octree Navigation
-
-Install from package manager in Unity with [https://github.com/TheosCreation/OctNav.git](https://github.com/TheosCreation/OctNav.git)
 
 ## OctVolume Class Example
 
@@ -400,7 +391,7 @@ Attempts to load a previously saved octree from disk. If a saved octree is found
 
 ### `BuildChildren()`
 
-Builds a new octree from the geometry (defined by `geometryMask`) located inside the current bounds of the `OctVolume`. This is the primary function to generate the octree structure and its associated navigation graphs from scratch. It also handles setting colliders to convex temporarily during the build process if `setCollidersToConex` is enabled.
+Builds a new octree from the geometry (defined by `geometryMask`) located inside the current bounds of the `OctVolume`. This is the primary function to generate the octree structure and its associated navigation graphs from scratch. It also handles setting colliders to convex temporarily during the build process if `setCollidersToConvex` is enabled.
 
 -   **Parameters:** None.
 
