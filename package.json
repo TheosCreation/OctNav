@@ -18,8 +18,5 @@
     "name": "OctNav",
     "email": "Theo.Morris@mds.ac.nz",
     "url": "https://github.com/TheosCreation"
-  },
-  "dependencies": {
-    "com.unity.nuget.newtonsoft-json": ""
   }
 }

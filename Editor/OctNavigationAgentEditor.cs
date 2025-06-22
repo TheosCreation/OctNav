@@ -2,14 +2,14 @@ using UnityEditor;
 using UnityEngine;
 namespace OctNav
 {
-    [CustomEditor(typeof(OctreeNavigationAgent))]
+    [CustomEditor(typeof(OctAgent))]
     [CanEditMultipleObjects]
-    public class OctreeNavigationAgentEditor : Editor
+    public class OctNavigationAgentEditor : Editor
     {
         public override void OnInspectorGUI()
         {
             DrawDefaultInspector();
-            OctreeNavigationAgent agentRef = (OctreeNavigationAgent)target;
+            OctAgent agentRef = (OctAgent)target;
 
             EditorGUILayout.Space();
             if (GUILayout.Button("Build Path"))
@@ -19,7 +19,7 @@ namespace OctNav
                     Debug.LogWarning("no target set for pathfinding");
                     return;
                 }
-                if(OctNavigation.GetGraph(agentRef.walking) == null)
+                if(OctManager.GetGraph(agentRef.walking) == null)
                 {
                     Debug.LogWarning("no octree graph calculated for pathfinding");
                     return;

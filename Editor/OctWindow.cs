@@ -41,7 +41,6 @@ namespace OctNav
         private void OnEnable()
         {
             EditorApplication.hierarchyChanged += OnHierarchyChanged;
-            EditorApplication.hierarchyChanged += ConstructUI;
             SceneManager.sceneLoaded += OnSceneLoaded;
             ConstructUI();
         }
@@ -54,12 +53,12 @@ namespace OctNav
         }
         private void OnHierarchyChanged()
         {
-            List<OctVolume> now = FindObjectsByType<OctVolume>(FindObjectsSortMode.InstanceID).ToList();
+          /*  List<OctVolume> now = FindObjectsByType<OctVolume>(FindObjectsSortMode.InstanceID).ToList();
             if (now.Count != prevVolumes.Count || !now.SequenceEqual(prevVolumes))
             {
                 prevVolumes = now;
                 ConstructUI();
-            }
+            }*/
         }
         private void OnSceneLoaded(Scene scene, LoadSceneMode mode)
         {
@@ -230,12 +229,12 @@ namespace OctNav
                     {
                         foreach (OctVolume vol in allVolumes)
                         {
-                            vol.BuildChildren();
+                            vol.Build();
                         }
                     }
                     else
                     {
-                        selectedVolume.BuildChildren();
+                        selectedVolume.Build();
                     }
                 })
                 { text = "Build Selected Volume" };
@@ -341,8 +340,9 @@ namespace OctNav
                 });
                 gizmoPanel.Add(showSurfaceToggle);
 
+                //will be updated to work with oct window selected voulme
 
-                Toggle onlyWhenSelectedToggle = new Toggle("Only Draw Gizmos On Selected Volumes")
+                /*Toggle onlyWhenSelectedToggle = new Toggle("Only Draw Gizmos On Selected Volumes")
                 {
                     value = selectedVolume != null && selectedVolume.drawGizmosOnlyWhenSelected
                 };
@@ -350,7 +350,7 @@ namespace OctNav
                 {
                     ApplyValue(vol => vol.drawGizmosOnlyWhenSelected = evt.newValue);
                 });
-                gizmoPanel.Add(onlyWhenSelectedToggle);
+                gizmoPanel.Add(onlyWhenSelectedToggle);*/
 
 
                 Toggle fadeToggle = new Toggle("Enable Distance Fade")
@@ -436,7 +436,7 @@ namespace OctNav
                     Button nextButton = new Button(() =>
                     {
                         if (selectedVolume == null) return;
-                        int maxIndex = OctVolume.GetAllLeafNodesCount() - 1;
+                        int maxIndex = OctManager.GetAllLeafNodesCount() - 1;
                         selectedVolume.currentNodeIndex = Mathf.Min(maxIndex, selectedVolume.currentNodeIndex + 1);
                         indexSlider.value = selectedVolume.currentNodeIndex;
                         EditorUtility.SetDirty(selectedVolume);
@@ -621,17 +621,18 @@ namespace OctNav
         {
             if (selectedVolume == null) return;
 
-            List<OctNode> allLeaves = OctVolume.GetAllLeafNodesInScene();
+            List<OctNode> allLeaves = OctManager.GetAllLeafNodesInScene();
+
             if (allLeaves == null || allLeaves.Count == 0) return;
 
-            int idx = Mathf.Clamp(selectedVolume.currentNodeIndex, 0, allLeaves.Count - 1);
-            OctNode selectedNode = allLeaves[idx];
+            int nodeIndex = Mathf.Clamp(selectedVolume.currentNodeIndex, 0, allLeaves.Count - 1);
+            OctNode selectedNode = allLeaves[nodeIndex];
 
-            Bounds b = new Bounds(
+            Bounds nodeBounds = new Bounds(
                 selectedNode.bounds.center,
                 Vector3.one * selectedNode.bounds.size.magnitude * 0.5f
             );
-            SceneView.lastActiveSceneView.Frame(b, false);
+            SceneView.lastActiveSceneView.Frame(nodeBounds, false);
         }
     }
 }

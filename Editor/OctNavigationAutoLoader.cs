@@ -19,12 +19,12 @@ namespace OctNav
         private static void OnEditorStartup()
         {
             EditorApplication.update -= OnEditorStartup;
-            OctNavigation.TryReloadOctreeVolumes();
+            OctManager.TryReloadOctreeVolumes();
         }
 
         private static void OnSceneOpened(Scene scene, OpenSceneMode mode)
         {
-            OctNavigation.TryReloadOctreeVolumes();
+            OctManager.TryReloadOctreeVolumes();
         }
     }
 

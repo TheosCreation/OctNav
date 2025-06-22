@@ -15,7 +15,7 @@ namespace OctNav
             EditorGUILayout.Space();
             if(GUILayout.Button("Build octrees"))
             {
-                boundRef.BuildChildren();
+                boundRef.Build();
             }        
             EditorGUILayout.Space();
             if(GUILayout.Button("Reset"))
@@ -30,7 +30,7 @@ namespace OctNav
             OctVolume[] volumes = Resources.FindObjectsOfTypeAll<OctVolume>();
             foreach (OctVolume vol in volumes)
             {
-                vol.BuildChildren();
+                vol.Build();
             }
         }
         public static void ResetAllVolumes()
