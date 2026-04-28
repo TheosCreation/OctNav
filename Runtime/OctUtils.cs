@@ -1,7 +1,88 @@
+using System;
 using System.Collections.Generic;
 using UnityEngine;
+using UnityEngine.SceneManagement;
 
 namespace OctNav {
+
+
+    /// <summary>
+    /// Represents a dynamic target that can reference either a Transform or a static Vector3 position.
+    /// If a Transform is assigned, its current world position is used; otherwise, a cached position is used.
+    /// Provides seamless conversion between Transform, Vector3, and tuple types for flexible usage in navigation and AI systems.
+    /// Supports addition, subtraction, and equality operators for target manipulation.
+    /// </summary>
+    [Serializable]
+    public class Target
+    {
+        [Tooltip("Target transform, if null, position will be used instead")]
+        public Transform transform;
+        [Tooltip("Cashed position, refer to currentPosition instead")]
+        public Vector3 position;
+        public Vector3 currentPosition
+        {
+            get
+            {
+                if (transform != null)
+                {
+                    return transform.position;
+                }
+
+                return position;
+            }
+        }
+        public Target(Transform targetTransform)
+        {
+            this.transform = targetTransform;
+            this.position = targetTransform.position;
+        }
+        public Target(Vector3 targetPoint)
+        {
+            this.position = targetPoint;
+            this.transform = null;
+        }
+        public Target(Vector3 targetPoint, Transform targetTransform)
+        {
+            this.transform = targetTransform;
+            this.position = targetPoint;
+        }
+        //get
+        public static implicit operator Transform(Target t) => t.transform;
+        //set
+        public static implicit operator Target(Transform t) => new Target(t);
+        //get
+        public static implicit operator Vector3?(Target t) => t.currentPosition;
+        //set 
+        public static implicit operator Target(Vector3 t) => new Target(t);
+        //get
+        public static implicit operator (Vector3 position, Transform transform)(Target t) => (t.position, t.transform);
+        //set
+        public static implicit operator Target((Vector3 position, Transform transform) tuple) => new Target(tuple.position, tuple.transform);
+
+        public static Target operator +(Target a, Target b)
+        {
+            Vector3 posA = a?.currentPosition ?? Vector3.zero;
+            Vector3 posB = b?.currentPosition ?? Vector3.zero;
+            return new Target(posA + posB);
+        }
+        public static Target operator -(Target a, Target b)
+        {
+            Vector3 posA = a?.currentPosition ?? Vector3.zero;
+            Vector3 posB = b?.currentPosition ?? Vector3.zero;
+            return new Target(posA - posB);
+        }
+        public static bool operator ==(Target a, Target b)
+        {
+            if (a is null && b is null) return true;
+            if (a is null || b is null) return false;
+            return a.currentPosition == b.currentPosition && a.transform == b.transform;
+        }
+        public static bool operator !=(Target a, Target b) => !(a == b);
+        public override bool Equals(object obj) => obj is Target t && this == t;
+        public override int GetHashCode() => (currentPosition, transform).GetHashCode();
+
+    }
+
     public enum OctColour
     {
         VibrantRed = 0,
@@ -144,7 +225,7 @@ namespace OctNav {
         /// <param name="last">The last actual point.</param>
         /// <param name="center">The center used for orientation reference.</param>
         /// <returns>The computed ghost point.</returns>
-        private static Vector3 ComputeGhostPoint(Vector3 prev, Vector3 last, Vector3 center)
+        public static Vector3 ComputeGhostPoint(Vector3 prev, Vector3 last, Vector3 center)
         {
             float delta = Vector3.Distance(last, prev);
 
@@ -159,6 +240,84 @@ namespace OctNav {
         }
 
         /// <summary>
+        /// Calculates a world-space bounding box that encapsulates all geometry under the given root.
+        /// </summary>
+        /// <param name="root">
+        /// The root GameObject whose hierarchy will be scanned. All child Renderers and Colliders
+        /// (including inactive ones) are considered when computing the bounds.
+        /// </param>
+        /// <param name="mask">mask to filter bounds check</param>
+        /// <returns>
+        /// A <see cref="Bounds"/> that tightly fits all detected Renderers and Colliders in the hierarchy.
+        /// If no valid geometry is found, a fallback bounds centered on the root with a minimal size
+        /// is returned to prevent zero-sized results.
+        /// </returns>
+        public static Bounds CalculateSceneBounds(LayerMask mask)
+        {
+            Scene scene = SceneManager.GetSceneAt(0);
+            GameObject[] rootGameObjects = scene.GetRootGameObjects();
+
+            bool hasBounds = false;
+            Bounds combinedBounds = new Bounds();
+
+            for (int i = 0; i < rootGameObjects.Length; i++)
+            {
+                GameObject root = rootGameObjects[i];
+
+                //Renderer[] renderers = root.GetComponentsInChildren<Renderer>(true);
+                //for (int r = 0; r < renderers.Length; r++)
+                //{
+                //    Renderer renderer = renderers[r];
+                //    if (renderer is ParticleSystemRenderer || renderer is TrailRenderer)
+                //    {
+                //        continue;
+                //    }
+//
+                //    if (!hasBounds)
+                //    {
+                //        combinedBounds = renderer.bounds;
+                //        hasBounds = true;
+                //    }
+                //    else
+                //    {
+                //        combinedBounds.Encapsulate(renderer.bounds);
+                //    }
+                //}
+
+                Collider[] colliders = root.GetComponentsInChildren<Collider>(true);
+                for (int c = 0; c < colliders.Length; c++)
+                {
+                    Collider collider = colliders[c];
+                    GameObject colliderObject = collider.gameObject;
+
+                    int colliderLayer = colliderObject.layer;
+                    bool layerAllowed = (mask.value & (1 << colliderLayer)) != 0;
+                    if (layerAllowed == false)
+                    {
+                        continue;
+                    }
+
+                    if (hasBounds == false)
+                    {
+                        combinedBounds = collider.bounds;
+                        hasBounds = true;
+                    }
+                    else
+                    {
+                        combinedBounds.Encapsulate(collider.bounds);
+                    }
+                }
+            }
+
+            if (!hasBounds)
+            {
+                combinedBounds = new Bounds(Vector3.zero, Vector3.one);
+            }
+
+            return combinedBounds;
+        }
+        
+        /// <summary>
         /// Extracts the portals (shared boundaries) between adjacent nodes in a path.
         /// </summary>
         /// <param name="path">A list of navigation nodes.</param>
@@ -169,8 +328,8 @@ namespace OctNav {
 
             for (int i = 0; i < path.Count - 1; i++)
             {
-                Bounds a = path[i].bounds;
-                Bounds b = path[i + 1].bounds;
+                Bounds a = path[i].Bounds;
+                Bounds b = path[i + 1].Bounds;
                 List<Vector3> portal = GetTouchingPortal(a, b);
 
                 if (portal != null && portal.Count == 4)
@@ -190,6 +349,7 @@ namespace OctNav {
         /// <param name="a">The first bounding box.</param>
         /// <param name="b">The second bounding box.</param>
         /// <returns>A list of 4 corner points defining the portal, or null if no valid portal exists.</returns>
+
         private static List<Vector3> GetTouchingPortal(Bounds a, Bounds b)
         {
             const float epsilon = 0.001f;
@@ -287,6 +447,64 @@ namespace OctNav {
 
             return quad;
         }
+        public class BinaryHeapPriorityQueue<T>
+        {
+            private struct Node { public T Item; public float Priority; }
+            private readonly List<Node> heap = new List<Node>();
 
+            public int Count => heap.Count;
+
+            public void Enqueue(T item, float priority)
+            {
+                heap.Add(new Node { Item = item, Priority = priority });
+                HeapifyUp(heap.Count - 1);
+            }
+
+            public T Dequeue()
+            {
+                var root = heap[0].Item;
+                var last = heap.Count - 1;
+                heap[0] = heap[last];
+                heap.RemoveAt(last);
+                if (heap.Count > 0) HeapifyDown(0);
+                return root;
+            }
+
+            private void HeapifyUp(int i)
+            {
+                Node node = heap[i];
+                while (i > 0)
+                {
+                    int parent = (i - 1) / 2;
+                    if (heap[parent].Priority <= node.Priority) break;
+                    heap[i] = heap[parent];
+                    i = parent;
+                }
+                heap[i] = node;
+            }
+
+            private void HeapifyDown(int i)
+            {
+                Node node = heap[i];
+                int last = heap.Count;
+                while (true)
+                {
+                    int left = 2 * i + 1;
+                    if (left >= last) break;
+                    int right = left + 1;
+                    int smallest = (right < last && heap[right].Priority < heap[left].Priority) ? right : left;
+                    if (heap[smallest].Priority >= node.Priority) break;
+                    heap[i] = heap[smallest];
+                    i = smallest;
+                }
+                heap[i] = node;
+            }
+
+            public void Clear()
+            {
+                heap.Clear();
+            }
+        }
     }
 }
+

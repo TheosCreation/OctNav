@@ -12,6 +12,12 @@ namespace OctNav
         public BoundsChanged OnBoundsChanged;
         public Bounds GetBounds() => new Bounds(center, size);
 
+        public void SetBounds(Vector3 newCenter, Vector3 newSize)
+        {
+            center = newCenter;
+            size = newSize;
+        }
+
         private void OnValidate()
         {
             if (OnBoundsChanged != null)

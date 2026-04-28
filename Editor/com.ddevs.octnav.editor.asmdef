@@ -1,18 +1,20 @@
-{
-    "name": "OctNavEditor",
-    "rootNamespace": "",
-    "references": [
-        "GUID:9b53079b81fe9e74680193359ea7025d"
-    ],
-    "includePlatforms": [
-        "Editor"
-    ],
-    "excludePlatforms": [],
-    "allowUnsafeCode": false,
-    "overrideReferences": false,
-    "precompiledReferences": [],
-    "autoReferenced": true,
-    "defineConstraints": [],
-    "versionDefines": [],
-    "noEngineReferences": false
-}
+    {
+        "name": "OctNavEditor",
+        "rootNamespace": "",
+        "references": [
+            "GUID:9b53079b81fe9e74680193359ea7025d",
+           "Unity.AI.Navigation", 
+           "NaughtyAttributes.Editor"
+        ],
+        "includePlatforms": [
+            "Editor"
+        ],
+        "excludePlatforms": [],
+        "allowUnsafeCode": false,
+        "overrideReferences": false,
+        "precompiledReferences": [],
+        "autoReferenced": true,
+        "defineConstraints": [],
+        "versionDefines": [],
+        "noEngineReferences": false
+    }

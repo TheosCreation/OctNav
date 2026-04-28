@@ -12,19 +12,22 @@ namespace OctNav
         /// Main navigation graph used for general pathfinding.
         /// </summary>
         public static OctNavGraph graph = new OctNavGraph();
-        
-        /// <summary>
-        /// Separate graph used for ground-based navigation constraints.
-        /// </summary>
-        public static OctNavGraph groundGraph = new OctNavGraph();
-
+        public static OctVolume volume = null;
+  
         /// <summary>
         /// Returns either the default graph or ground-constrained graph.
         /// </summary>
         /// <param name="grounded">Whether to return the ground-specific graph.</param>
         public static OctNavGraph GetGraph(bool grounded = false)
         {
-            return grounded ? groundGraph : graph;
+            if (graph == null) graph = new OctNavGraph();
+            return graph;
+           // return grounded ? null : graph;
+        } 
+        
+        public static OctVolume GetVolume()
+        {
+            return volume;
         }
 
         /// <summary>
@@ -106,7 +109,6 @@ namespace OctNav
         public static void TryReloadOctreeVolumes()
         {
             graph = new OctNavGraph();
-            groundGraph = new OctNavGraph();
 
             OctVolume[] octVolumes = Object.FindObjectsByType<OctVolume>(FindObjectsSortMode.None);
             foreach (OctVolume volume in octVolumes)

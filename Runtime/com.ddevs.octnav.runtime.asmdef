@@ -1,7 +1,10 @@
 {
     "name": "OctNavRuntime",
     "rootNamespace": "",
-    "references": [],
+    "references": [
+        "Unity.AI.Navigation",
+        "NaughtyAttributes.Core"
+    ],
     "includePlatforms": [],
     "excludePlatforms": [],
     "allowUnsafeCode": false,

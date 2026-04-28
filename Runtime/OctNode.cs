@@ -16,6 +16,7 @@ namespace OctNav
     {
         private static int nextId;
         public readonly int id;
+        public int bfsSearchId;
 
         public Bounds bounds;
         public OctNode[] children = new OctNode[0];
@@ -27,7 +28,7 @@ namespace OctNav
         public bool isEdge = false;
         public bool hasCollision = false;
 
-        public List<Direction> edgeDirs = new List<Direction>();
+        public Direction[] edgeDirs = new Direction[6];
         public OctNode[] faceLinks = new OctNode[6]; // Cached face neighbors
         public OctNode[] neighbourLinks;             // Custom connections
         public OctNode parent;
@@ -105,14 +106,18 @@ namespace OctNav
 
                 branchNode = branchNode.parent;
             }
-
-            if (branchLevel < 0) return null;
+            if (branchLevel < 0 || branchNode == null || branchNode.parent == null) return null;
 
             int siblingIndex = path[branchLevel] ^ (1 << axis);
             OctNode neighbour = branchNode.parent.children[siblingIndex];
+        
 
             for (int level = branchLevel - 1; level >= 0; level--)
-            {
+            {   
+                if (neighbour == null)
+                {
+                    return null;
+                }
                 if (neighbour.children == null || neighbour.children.Length == 0) break;
 
                 int childIndex = 0;
@@ -190,28 +195,40 @@ namespace OctNav
         /// Recursively subdivides this node and its children to the specified max depth,
         /// checking geometry intersection at each level.
         /// </summary>
-        public void SubdivideRecursive(int maxDepth, LayerMask geometryMask, Bounds volumeBounds)
+        public void SubdivideRecursive(int maxDepth, LayerMask geometryMask, Bounds volumeBounds, float targetResolution)
         {
             if (!volumeBounds.Intersects(bounds))
             {
-                isLeaf = true;
-                hasCollision = true;
                 isOutside = true;
+                hasCollision = false;
+                isLeaf = true;
                 return;
             }
 
             hasCollision = CheckCollision(geometryMask);
-            if (depth >= maxDepth || !hasCollision)
+
+            float minSize = Mathf.Min(bounds.size.x, bounds.size.y, bounds.size.z);
+            bool atResolution = (minSize <= targetResolution);
+
+            if (depth >= maxDepth || !hasCollision || atResolution)
+            {
+                isLeaf = true;
+                return;
+            }
+            
+            //Parent has split so this is no longer a leaf node setting this just incase
+            isLeaf = false;
+            Split();
+
+            if (children == null || children.Length == 0)
             {
                 isLeaf = true;
                 return;
             }
 
-            Split();
-
             foreach (OctNode child in children)
             {
-                child.SubdivideRecursive(maxDepth, geometryMask, volumeBounds);
+                child.SubdivideRecursive(maxDepth, geometryMask, volumeBounds, targetResolution);
             }
         }
     }

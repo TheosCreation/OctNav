@@ -6,8 +6,6 @@ using UnityEditor.UIElements;
 using UnityEngine;
 using UnityEngine.SceneManagement;
 using UnityEngine.UIElements;
-using System;
-using System.Linq;
 
 namespace OctNav
 {
@@ -27,7 +25,6 @@ namespace OctNav
         private OctVolume selectedVolume = null;
         private PopupField<string> volumePopup = null;
         private List<OctVolume> allVolumes = new List<OctVolume>();
-        private bool autoSelectNearest = false;
         private string currentTab = "Build";
         [MenuItem("Window/OctWindow %#o")]
         public static void ShowWindow()
@@ -80,6 +77,8 @@ namespace OctNav
             allVolumes = new List<OctVolume>(FindObjectsByType<OctVolume>(FindObjectsSortMode.InstanceID));
             if (selectedVolume != null && !allVolumes.Contains(selectedVolume)) selectedVolume = null;
 
+          
+
             #region Header
             {
                 VisualElement headerContainer = new VisualElement
@@ -119,7 +118,44 @@ namespace OctNav
             }
             #endregion
 
-           
+            Button RefreshVolumeButton = new Button(() =>
+            {
+                allVolumes = new List<OctVolume>(FindObjectsByType<OctVolume>(FindObjectsSortMode.InstanceID));
+                RefreshAllPanels();
+            })
+            { text = "Refresh" };
+            rootVisualElement.Add(RefreshVolumeButton);
+
+            if (allVolumes == null || allVolumes.Count == 0)
+            {
+                Label noVolumeLabel = new Label("No OctVolume found in scene.\nClick below to create one.")
+                {
+                    style =
+                    {
+                        unityFontStyleAndWeight = FontStyle.Italic,
+                        marginBottom = 8,
+                        whiteSpace = WhiteSpace.Normal,
+                    }
+                };
+                rootVisualElement.Add(noVolumeLabel);
+
+            
+                Button createVolumeButton = new Button(() =>
+                {
+                    allVolumes = new List<OctVolume>(FindObjectsByType<OctVolume>(FindObjectsSortMode.InstanceID));
+                    GameObject go = new GameObject($"OctVolume{allVolumes.Count+1}");
+                    OctVolume vol = go.AddComponent<OctVolume>();
+                    Selection.activeObject = go;
+                    allVolumes.Add(vol);
+                    RefreshAllPanels();
+                })
+                { text = "Create New OctVolume" };
+                rootVisualElement.Add(createVolumeButton);
+
+                return;
+            }
+  
+
 
             #region Volume Selector
             {
@@ -148,7 +184,7 @@ namespace OctNav
                         {
                             selectedVolume = null;
                         }
-                        else
+                        else if( allVolumes.Count > 0)
                         {
                             selectedVolume = allVolumes.Find(v => v.gameObject.name == chosen);
                         }
@@ -218,10 +254,19 @@ namespace OctNav
                 closeButton.style.marginLeft = 6;
                 closeButton.tooltip = "Dismiss";
                 warningBox.Add(closeButton);
-
-
-
                 buildPanel.Add(warningBox);
+
+                Button createVolumeButton = new Button(() =>
+                {
+                    allVolumes = new List<OctVolume>(FindObjectsByType<OctVolume>(FindObjectsSortMode.InstanceID));
+                    GameObject go = new GameObject($"OctVolume{allVolumes.Count + 1}");
+                    OctVolume vol = go.AddComponent<OctVolume>();
+                    Selection.activeObject = go;
+                    allVolumes.Add(vol);
+                    RefreshAllPanels();
+                })
+                { text = "Create New OctVolume" };
+                buildPanel.Add(createVolumeButton);
 
                 Button buildSelectedButton = new Button(() =>
                 {
@@ -462,7 +507,7 @@ namespace OctNav
                         if (selectedVolume == null) return;
                         SceneView sv = SceneView.lastActiveSceneView;
                         if (sv?.camera == null) return;
-
+                    
                         Vector3 camPos = sv.camera.transform.position;
                         List<OctNode> nodes = selectedVolume.allNodes;
                         if (nodes == null || nodes.Count == 0) return;
@@ -496,6 +541,7 @@ namespace OctNav
                         previousButton.style.display = evt.newValue ? DisplayStyle.Flex : DisplayStyle.None;
                         nextButton.style.display = evt.newValue ? DisplayStyle.Flex : DisplayStyle.None;
                         frameButton.style.display = evt.newValue ? DisplayStyle.Flex : DisplayStyle.None;
+                        selectNearestButton.style.display = evt.newValue ? DisplayStyle.Flex : DisplayStyle.None;
 
                         SceneView.RepaintAll();
                     });
@@ -535,12 +581,32 @@ namespace OctNav
                     ApplyValue(vol => vol.geometryMask = evt.newValue);
                 });
                 settingsPanel.Add(maskField);
+                LayerMaskField cullingToggle = new LayerMaskField("Geometry Mask")
+                {
+                    value = selectedVolume != null ? selectedVolume.geometryMask : ~0
+                };
+                maskField.RegisterValueChangedCallback(evt =>
+                {
+                    ApplyValue(vol => vol.geometryMask = evt.newValue);
+                });
+                settingsPanel.Add(maskField);
 
                 rootVisualElement.Add(settingsPanel);
             }
             #endregion
-
             ShowPanel(currentTab);
+
+            #region Docs Button
+
+            Button docsButton = new Button(() =>
+            {
+                Application.OpenURL("https://github.com/DeviousDevsStudios/OctNav/blob/main/README.md");
+            })
+            { text = "Open Online Docs" };
+
+            docsButton.tooltip = "View the OctNav documentation website";
+            rootVisualElement.Add(docsButton);
+            #endregion
         }
 
         private void ShowPanel(string panelName)

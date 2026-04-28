@@ -2,257 +2,399 @@
 using System.IO;
 using System.Linq;
 using System;
+using System.Text;
 using UnityEngine;
-using Unity.Plastic.Newtonsoft.Json;
 
 namespace OctNav
 {
     /// <summary>
-    /// Serializable wrapper for UnityEngine.Vector3 to support JSON serialization.
-    /// </summary>
-    [System.Serializable]
-    public class SerializableVector3
-    {
-        public float x, y, z;
-
-        public SerializableVector3() { }
-
-        public SerializableVector3(Vector3 v)
-        {
-            x = v.x;
-            y = v.y;
-            z = v.z;
-        }
-
-        public Vector3 ToVector3() => new Vector3(x, y, z);
-    }
-
-    /// <summary>
-    /// Serializable wrapper for UnityEngine.Bounds using SerializableVector3.
-    /// </summary>
-    [System.Serializable]
-    public class SerializableBounds
-    {
-        public SerializableVector3 center;
-        public SerializableVector3 size;
-
-        public SerializableBounds() { }
-
-        public SerializableBounds(Bounds bounds)
-        {
-            center = new SerializableVector3(bounds.center);
-            size = new SerializableVector3(bounds.size);
-        }
-
-        public Bounds ToBounds() => new Bounds(center.ToVector3(), size.ToVector3());
-    }
-
-    /// <summary>
-    /// Represents a full serialized OctVolume including root node and key node lists.
-    /// </summary>
-    public class SerializableOctVolumeData
-    {
-        public SerializableOctNode root;
-        public List<int> allNodeIds;
-        public List<int> emptyLeafIds;
-        public List<int> hitNodesIds;
-    }
-
-    /// <summary>
-    /// Represents a serialized edge connection between two node IDs.
-    /// </summary>
-    [Serializable]
-    public class SerializableEdge
-    {
-        public int a, b;
-        public SerializableEdge(int a, int b) { this.a = a; this.b = b; }
-    }
-
-    /// <summary>
-    /// Serializable representation of an OctNode, including bounds and face connections.
-    /// </summary>
-    [System.Serializable]
-    public class SerializableOctNode
-    {
-        public int id;
-        public SerializableBounds bounds;
-        public bool isLeaf;
-        public bool hasCollision;
-        public bool isOutside;
-        public int depth;
-        public List<int> faceLinkIds = new List<int>();
-        public List<SerializableOctNode> children = new List<SerializableOctNode>();
-    }
-
-    /// <summary>
-    /// Handles serialization and deserialization of OctNode trees and OctVolume state to JSON files.
+    /// Handles binary serialization and deserialization of OctNode trees and OctVolume state.
+    /// Format is versioned and little-endian.
     /// </summary>
     public static class OctVolumeConvert
     {
-        static Dictionary<int, OctNode> idMap = new Dictionary<int, OctNode>();
+        // File tags
+        const int MAGIC_NODE = 0x4F435456; // 'OCTV'
+        const int MAGIC_VOL = 0x4F435646; // 'OCVF'
+        const int VERSION = 1;
 
-        /// <summary>
-        /// Recursively serializes an OctNode and its children into a SerializableOctNode.
-        /// </summary>
-        public static SerializableOctNode SerializeNode(OctNode node)
+        static Dictionary<int, OctNode> idMap = new Dictionary<int, OctNode>(1024);
+        static Dictionary<int, int[]> pendingFaceLinks = new Dictionary<int, int[]>(1024);
+
+        // -------- Core binary helpers --------
+
+        static void WriteVec3(BinaryWriter bw, Vector3 v)
         {
-            SerializableOctNode data = new SerializableOctNode
-            {
-                id = node.id,
-                bounds = new SerializableBounds(node.bounds),
-                isLeaf = node.isLeaf,
-                hasCollision = node.hasCollision,
-                isOutside = node.isOutside,
-                depth = node.depth,
-                faceLinkIds = node.faceLinks.Select(n => n != null ? n.id : -1).ToList()
-            };
-
-            if (node.children != null)
-            {
-                foreach (OctNode child in node.children)
-                {
-                    data.children.Add(SerializeNode(child));
-                }
-            }
-
-            return data;
+            bw.Write(v.x); bw.Write(v.y); bw.Write(v.z);
         }
 
-        /// <summary>
-        /// Recursively deserializes a SerializableOctNode into an OctNode, rebuilding hierarchy.
-        /// </summary>
-        public static OctNode DeserializeNode(SerializableOctNode data, OctNode parent)
+        static Vector3 ReadVec3(BinaryReader br)
         {
-            OctNode node = new OctNode(data.id, data.bounds.center.ToVector3(), data.bounds.size.ToVector3(), parent)
-            {
-                isLeaf = data.isLeaf,
-                hasCollision = data.hasCollision,
-                isOutside = data.isOutside,
-                depth = data.depth
-            };
+            float x = br.ReadSingle();
+            float y = br.ReadSingle();
+            float z = br.ReadSingle();
+            return new Vector3(x, y, z);
+        }
 
-            idMap.Add(data.id, node);
+        static void WriteBounds(BinaryWriter bw, Bounds b)
+        {
+            WriteVec3(bw, b.center);
+            WriteVec3(bw, b.size);
+        }
 
-            if (data.children.Count > 0)
+        static Bounds ReadBounds(BinaryReader br)
+        {
+            var c = ReadVec3(br);
+            var s = ReadVec3(br);
+            return new Bounds(c, s);
+        }
+
+        // -------- Node I/O --------
+
+        static void WriteNode(BinaryWriter bw, OctNode node)
+        {
+            // Header for this node
+            bw.Write(node.id);
+            WriteBounds(bw, node.bounds);
+            bw.Write(node.isLeaf);
+            bw.Write(node.hasCollision);
+            bw.Write(node.isOutside);
+            bw.Write(node.depth);
+
+            // Face links as IDs (6 ints)
+            for (int i = 0; i < 6; i++)
             {
-                node.children = new OctNode[8];
-                for (int i = 0; i < data.children.Count; i++)
+                int id = (node.faceLinks != null && i < node.faceLinks.Length && node.faceLinks[i] != null)
+                    ? node.faceLinks[i].id
+                    : -1;
+                bw.Write(id);
+            }
+
+            // Children presence mask (8 bools), then recursively write present children in index order
+            bool hasChildren = node.children != null && node.children.Length == 8;
+            for (int i = 0; i < 8; i++)
+            {
+                bw.Write(hasChildren && node.children[i] != null);
+            }
+            if (hasChildren)
+            {
+                for (int i = 0; i < 8; i++)
                 {
-                    node.children[i] = DeserializeNode(data.children[i], node);
+                    if (node.children[i] != null)
+                        WriteNode(bw, node.children[i]);
                 }
             }
+        }
+
+        static OctNode ReadNode(BinaryReader br, OctNode parent)
+        {
+            int id = br.ReadInt32();
+            Bounds bounds = ReadBounds(br);
+
+            // Construct node
+            var node = new OctNode(id, bounds.center, bounds.size, parent);
+
+            node.isLeaf = br.ReadBoolean();
+            node.hasCollision = br.ReadBoolean();
+            node.isOutside = br.ReadBoolean();
+            node.depth = br.ReadInt32();
+
+            // Prepare face links
+            if (node.faceLinks == null || node.faceLinks.Length != 6)
+                node.faceLinks = new OctNode[6];
+
+            // Capture face link IDs for later resolution
+            int[] six = new int[6];
+            for (int i = 0; i < 6; i++) six[i] = br.ReadInt32();
+            pendingFaceLinks[id] = six;
+
+            // Read children presence mask
+            bool[] present = new bool[8];
+            for (int i = 0; i < 8; i++) present[i] = br.ReadBoolean();
+
+            // Recurse
+            node.children = new OctNode[8];
+            for (int i = 0; i < 8; i++)
+            {
+                if (present[i])
+                    node.children[i] = ReadNode(br, node);
+                else
+                    node.children[i] = null;
+            }
+
+            // Map ID
+            idMap[id] = node;
             return node;
         }
 
-        /// <summary>
-        /// Ensures the target directory exists before saving.
-        /// </summary>
+        static void ResolveAllFaceLinks()
+        {
+            if (pendingFaceLinks == null || pendingFaceLinks.Count == 0) return;
+
+            foreach (var kv in pendingFaceLinks)
+            {
+                int nodeId = kv.Key;
+                int[] links = kv.Value;
+
+                if (!idMap.TryGetValue(nodeId, out var node)) continue;
+
+                if (node.faceLinks == null || node.faceLinks.Length != 6)
+                    node.faceLinks = new OctNode[6];
+
+                for (int i = 0; i < 6; i++)
+                {
+                    int linkId = links[i];
+                    node.faceLinks[i] = (linkId >= 0 && idMap.TryGetValue(linkId, out var neigh)) ? neigh : null;
+                }
+            }
+
+            pendingFaceLinks.Clear();
+        }
+
+        // -------- Filesystem helpers --------
+
         public static void EnsureDirectory(string path)
         {
             string dir = Path.GetDirectoryName(path);
-            if (!Directory.Exists(dir))
-            {
+            if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir))
                 Directory.CreateDirectory(dir);
-            }
         }
 
-        /// <summary>
-        /// Saves a single OctNode hierarchy to a JSON file.
-        /// </summary>
+        // -------- Public API: node-only files --------
+
         public static void SaveToFile(string path, OctNode root)
         {
             EnsureDirectory(path);
-            SerializableOctNode serialized = SerializeNode(root);
-            string json = JsonConvert.SerializeObject(serialized, Formatting.Indented);
-            File.WriteAllText(path, json);
-            Debug.Log($"[OctVolume] Saved to {path}");
+            using (var fs = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.None, 1 << 20))
+            using (var bw = new BinaryWriter(fs, Encoding.UTF8, false))
+            {
+                bw.Write(MAGIC_NODE);
+                bw.Write(VERSION);
+                WriteNode(bw, root);
+            }
+            Debug.Log("[OctVolume] Saved binary node to " + path);
         }
 
-        /// <summary>
-        /// Loads an OctNode hierarchy from a JSON file.
-        /// </summary>
         public static OctNode LoadFromFile(string path)
         {
             if (!File.Exists(path)) return null;
 
-            string json = File.ReadAllText(path);
-            SerializableOctNode data = JsonConvert.DeserializeObject<SerializableOctNode>(json);
-            return DeserializeNode(data, null);
+            idMap.Clear();
+            pendingFaceLinks.Clear();
+
+            using (var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 20, FileOptions.SequentialScan))
+            using (var br = new BinaryReader(fs, Encoding.UTF8, false))
+            {
+                int magic = br.ReadInt32();
+                int version = br.ReadInt32();
+                if (magic != MAGIC_NODE) throw new InvalidDataException("Bad magic for node file.");
+                if (version != VERSION) throw new NotSupportedException("Unsupported version.");
+
+                var root = ReadNode(br, null);
+                ResolveAllFaceLinks();
+                return root;
+            }
         }
 
-        /// <summary>
-        /// Saves a full OctVolume including node metadata and hierarchy.
-        /// </summary>
+        // -------- Public API: full volume files --------
+
         public static void SaveFullVolume(string path, OctVolume vol)
         {
-            SerializableOctNode serializedRoot = SerializeNode(vol.root);
-
-            SerializableOctVolumeData container = new SerializableOctVolumeData
-            {
-                root = serializedRoot,
-                allNodeIds = vol.allNodes.Select(n => n.id).ToList(),
-                emptyLeafIds = vol.emptyLeaves.Select(n => n.id).ToList(),
-                hitNodesIds = vol.hitNodes.Select(n => n.id).ToList()
-            };
+            EnsureDirectory(path);
 
             System.Threading.Tasks.Task.Run(() =>
             {
                 try
                 {
-                    string json = JsonConvert.SerializeObject(container, Formatting.Indented);
+                    using (var fs = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.None, 1 << 20))
+                    using (var bw = new BinaryWriter(fs, Encoding.UTF8, false))
+                    {
+                        bw.Write(MAGIC_VOL);
+                        bw.Write(VERSION);
 
-                    string dir = Path.GetDirectoryName(path);
-                    if (!Directory.Exists(dir)) Directory.CreateDirectory(dir);
+                        WriteBounds(bw, vol.bounds);
+                        
+                        // Root tree
+                        WriteNode(bw, vol.root);
 
-                    File.WriteAllText(path, json);
-                    //Debug.Log($"[OctVolume] saved to {path}");
+                        // allNodeIds
+                        int allCount = vol.allNodes != null ? vol.allNodes.Count : 0;
+                        bw.Write(allCount);
+                        if (allCount > 0)
+                        {
+                            for (int i = 0; i < allCount; i++) bw.Write(vol.allNodes[i].id);
+                        }
+
+                        // emptyLeafIds
+                        int emptyCount = vol.emptyLeaves != null ? vol.emptyLeaves.Count : 0;
+                        bw.Write(emptyCount);
+                        if (emptyCount > 0)
+                        {
+                            for (int i = 0; i < emptyCount; i++) bw.Write(vol.emptyLeaves[i].id);
+                        }
+
+                        // hitNodesIds
+                        int hitCount = vol.hitNodes != null ? vol.hitNodes.Count : 0;
+                        bw.Write(hitCount);
+                        if (hitCount > 0)
+                        {
+                            for (int i = 0; i < hitCount; i++) bw.Write(vol.hitNodes[i].id);
+                        }
+                    }
                 }
-                catch (System.Exception ex)
+                catch (Exception ex)
                 {
-                    Debug.LogError($"[OctVolume] Async save failed: {ex.Message}");
+                    Debug.LogError("[OctVolume] Async binary save failed: " + ex.Message);
                 }
             });
         }
 
-
-        /// <summary>
-        /// Loads a full OctVolume including node metadata, connectivity, and root structure.
-        /// </summary>
         public static bool LoadFullVolume(string path, OctVolume vol)
         {
-            if (!File.Exists(path)) return false;
-
-            idMap.Clear();
-
-            SerializableOctVolumeData container = JsonConvert.DeserializeObject<SerializableOctVolumeData>(File.ReadAllText(path));
-            vol.root = DeserializeNode(container.root, null);
-
-            AssignFaceLinks(container.root);
-
-            vol.allNodes = container.allNodeIds.Where(idMap.ContainsKey).Select(id => idMap[id]).ToList();
-            vol.emptyLeaves = container.emptyLeafIds.Where(idMap.ContainsKey).Select(id => idMap[id]).ToList();
-            vol.hitNodes = container.hitNodesIds.Where(idMap.ContainsKey).Select(id => idMap[id]).ToList();
-
-            return true;
-        }
-
-        /// <summary>
-        /// Recursively assigns face neighbor links based on stored node IDs.
-        /// </summary>
-        static void AssignFaceLinks(SerializableOctNode sNode)
-        {
-            if (idMap.TryGetValue(sNode.id, out OctNode realNode) && sNode.faceLinkIds != null)
+            if (vol == null)
             {
-                for (int i = 0; i < sNode.faceLinkIds.Count && i < 6; i++)
-                {
-                    int linkId = sNode.faceLinkIds[i];
-                    realNode.faceLinks[i] = linkId >= 0 && idMap.TryGetValue(linkId, out OctNode linkedNode) ? linkedNode : null;
-                }
+                Debug.LogError("[OctVolume] Load failed: OctVolume is null");
+                return false;
             }
-
-            foreach (SerializableOctNode child in sNode.children)
+        
+            if (string.IsNullOrEmpty(path))
             {
-                AssignFaceLinks(child);
+                Debug.LogError("[OctVolume] Load failed: path is null or empty");
+                return false;
+            }
+        
+            if (!File.Exists(path))
+            {
+                Debug.LogWarning("[OctVolume] Volume file does not exist: " + path);
+                return false;
+            }
+        
+            try
+            {
+                idMap.Clear();
+                pendingFaceLinks.Clear();
+        
+                using (FileStream fileStream =
+                       new FileStream(
+                           path,
+                           FileMode.Open,
+                           FileAccess.Read,
+                           FileShare.Read,
+                           1 << 20,
+                           FileOptions.SequentialScan))
+                using (BinaryReader binaryReader =
+                       new BinaryReader(fileStream, Encoding.UTF8, false))
+                {
+                    int magic = binaryReader.ReadInt32();
+                    int version = binaryReader.ReadInt32();
+        
+                    if (magic != MAGIC_VOL)
+                    {
+                        Debug.LogError("[OctVolume] Invalid magic header in volume file: " + path);
+                        return false;
+                    }
+        
+                    if (version != VERSION)
+                    {
+                        Debug.LogError(
+                            "[OctVolume] Unsupported volume version. Expected " +
+                            VERSION + " but got " + version
+                        );
+                        return false;
+                    }
+        
+                    // Bounds
+                    Bounds bounds = ReadBounds(binaryReader);
+                    vol.bounds = bounds;
+                    vol.boundHandles.SetBounds(bounds.center, bounds.size);
+        
+                    // Root
+                    vol.root = ReadNode(binaryReader, null);
+                    ResolveAllFaceLinks();
+        
+                    // allNodes
+                    int allCount = Mathf.Max(0, binaryReader.ReadInt32());
+                    if (vol.allNodes == null)
+                    {
+                        vol.allNodes = new List<OctNode>(allCount);
+                    }
+                    else
+                    {
+                        vol.allNodes.Clear();
+                        if (vol.allNodes.Capacity < allCount)
+                        {
+                            vol.allNodes.Capacity = allCount;
+                        }
+                    }
+        
+                    for (int i = 0; i < allCount; i++)
+                    {
+                        int id = binaryReader.ReadInt32();
+                        if (idMap.TryGetValue(id, out OctNode node))
+                        {
+                            vol.allNodes.Add(node);
+                        }
+                    }
+        
+                    // emptyLeaves
+                    int emptyCount = Mathf.Max(0, binaryReader.ReadInt32());
+                    if (vol.emptyLeaves == null)
+                    {
+                        vol.emptyLeaves = new List<OctNode>(emptyCount);
+                    }
+                    else
+                    {
+                        vol.emptyLeaves.Clear();
+                        if (vol.emptyLeaves.Capacity < emptyCount)
+                        {
+                            vol.emptyLeaves.Capacity = emptyCount;
+                        }
+                    }
+        
+                    for (int i = 0; i < emptyCount; i++)
+                    {
+                        int id = binaryReader.ReadInt32();
+                        if (idMap.TryGetValue(id, out OctNode node))
+                        {
+                            vol.emptyLeaves.Add(node);
+                        }
+                    }
+        
+                    // hitNodes
+                    int hitCount = Mathf.Max(0, binaryReader.ReadInt32());
+                    if (vol.hitNodes == null)
+                    {
+                        vol.hitNodes = new List<OctNode>(hitCount);
+                    }
+                    else
+                    {
+                        vol.hitNodes.Clear();
+                        if (vol.hitNodes.Capacity < hitCount)
+                        {
+                            vol.hitNodes.Capacity = hitCount;
+                        }
+                    }
+        
+                    for (int i = 0; i < hitCount; i++)
+                    {
+                        int id = binaryReader.ReadInt32();
+                        if (idMap.TryGetValue(id, out OctNode node))
+                        {
+                            vol.hitNodes.Add(node);
+                        }
+                    }
+                }
+        
+                Debug.Log("[OctVolume] Loaded volume successfully: " + path);
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Debug.LogError(
+                    "[OctVolume] Failed to load volume file: " + path +
+                    "\n" + ex
+                );
+                return false;
             }
         }
     }

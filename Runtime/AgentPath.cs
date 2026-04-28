@@ -31,6 +31,57 @@ namespace OctNav
             waypoints.Add(point);
         }
 
+        public void AddCircle(Vector3 center, float radius, int waypointCount, bool clockwise = true, float circleYOffset = 0)
+        {
+            if (waypointCount <= 0 || radius <= 0f) return;
+
+            float radiusSqr = radius * radius;
+            waypoints.RemoveAll(p =>
+                (p.x - center.x) * (p.x - center.x)
+              + (p.y - center.y) * (p.y - center.y)
+              + (p.z - center.z) * (p.z - center.z)
+              < radiusSqr
+            );
+
+            if (waypoints.Count == 0)
+            {
+                float step = 2f * Mathf.PI / waypointCount;
+                for (int i = 0; i < waypointCount; i++)
+                {
+                    float ang = (clockwise ? -1f : 1f) * i * step;
+                    waypoints.Add(new Vector3(
+                        center.x + Mathf.Cos(ang) * radius,
+                        center.y + circleYOffset,
+                        center.z + Mathf.Sin(ang) * radius
+                    ));
+                }
+                return;
+            }
+
+            float angleStep = 2f * Mathf.PI / waypointCount;
+
+            Vector3 last = waypoints[waypoints.Count - 1];
+            float lastAngle = Mathf.Atan2(last.z - center.z, last.x - center.x);
+            if (lastAngle < 0f) lastAngle += 2f * Mathf.PI;
+
+            int startIdx = Mathf.RoundToInt(lastAngle / angleStep) % waypointCount;
+
+            for (int stepIdx = 1; stepIdx < waypointCount; stepIdx++)
+            {
+                int idx = clockwise
+                    ? (startIdx - stepIdx + waypointCount) % waypointCount
+                    : (startIdx + stepIdx) % waypointCount;
+
+                float ang = idx * angleStep;
+                waypoints.Add(new Vector3(
+                    center.x + Mathf.Cos(ang) * radius,
+                    center.y + circleYOffset,
+                    center.z + Mathf.Sin(ang) * radius
+                ));
+            }
+        }
+
+
         /// <summary>
         /// Gets the number of waypoints in the path.
         /// </summary>

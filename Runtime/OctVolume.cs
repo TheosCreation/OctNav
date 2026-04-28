@@ -1,4 +1,3 @@
-using Codice.Client.Common.TreeGrouper;
 using System;
 using System.Collections.Generic;
 using System.IO;
@@ -6,6 +5,8 @@ using System.Linq;
 using UnityEditor;
 using UnityEngine;
 using UnityEngine.Profiling;
+using Unity.AI.Navigation;
+
 using static OctNav.OctNavGraph;
 
 namespace OctNav
@@ -16,9 +17,10 @@ namespace OctNav
         [Header("Settings")]
         public LayerMask geometryMask = ~0;
         public int maxDepth = 5;
-        public float toleranceForFittingCubes = 0.5f;
+        public float targetResolution = 10.0f;
         [Tooltip("If you're not using convex shapes there will be nodes AI will try to path to inside geometry, turning this on fixes this.")]
         public bool performCulling = false;
+
         [Header("Gizmos")]
         public bool drawGizmosOnlyWhenSelected = false;
         public bool showHitGizmos = false;
@@ -27,11 +29,13 @@ namespace OctNav
         public bool drawGraph = false;
         public bool drawGroundedGraph = false;
         public bool showEmptyLeavesGizmos = false;
-        public bool selectionMode = false;
+        [HideInInspector] public bool selectionMode = false;
         public bool enableDistanceFade = false;
         public float fadeStartDistance = 100;
         public float fadeEndDistance = 200;
 
+        private bool isLoaded = false;
+        
         [HideInInspector] public List<OctNode> allNodes = new List<OctNode>();
         [HideInInspector] public List<OctNode> hitNodes = new List<OctNode>();
         [HideInInspector] public HashSet<OctNode> walkableSet = new HashSet<OctNode>();
@@ -44,18 +48,73 @@ namespace OctNav
         List<OctNode> culledNodes = new List<OctNode>();
         private Vector3 sceneCamPos;
         private List<Collider> surfaceObjects;
-        private float biggestSide;
+        private float biggestSide = 10;
         private Bounds RootBounds;
 
+        [Tooltip("Size of smallest octree node.")]
+        public float minScale => biggestSide / maxDepth;
         public static string OctreeSaveDirectory => Path.Combine(Directory.GetParent(Application.dataPath).FullName, "SceneData", "OctreeData");
-        public string SavePath => Path.Combine(OctreeSaveDirectory, $"{gameObject.scene.name}_{gameObject.name}.json");
+        public string SavePath => Path.Combine(OctreeSaveDirectory, $"{gameObject.scene.name}_{gameObject.name}.ocv");
+        public static string SceneDataFolderName
+        {
+            get
+            {
+                return "SceneData";
+            }
+        }
 
+        public static string OctreeSubfolderName
+        {
+            get
+            {
+                return "OctreeData";
+            }
+        }
+
+        public static string ExternalSceneDataRoot
+        {
+            get
+            {
+#if UNITY_EDITOR
+                return Path.Combine(Directory.GetParent(Application.dataPath).FullName, SceneDataFolderName, OctreeSubfolderName);
+#elif UNITY_STANDALONE_OSX
+                return Path.Combine(Directory.GetParent(Application.dataPath).Parent.Parent.FullName, SceneDataFolderName, OctreeSubfolderName);
+#elif UNITY_STANDALONE_WIN || UNITY_STANDALONE_LINUX
+                return Path.Combine(Path.GetDirectoryName(Application.dataPath), SceneDataFolderName, OctreeSubfolderName);
+#else
+                return Path.Combine(Application.persistentDataPath, SceneDataFolderName, OctreeSubfolderName);
+#endif
+            }
+        }
+
+        public static string RuntimeSceneDataRoot
+        {
+            get
+            {
+                // Writable cache
+                return Path.Combine(Application.persistentDataPath, SceneDataFolderName, OctreeSubfolderName);
+            }
+        }
+
+        public string SaveFileName
+        {
+            get
+            {
+                return gameObject.scene.name + "_" + gameObject.name + ".ocv";
+            }
+        }
         private void Awake()
         {
-            if (!LoadOctree())
+            if (!isLoaded)
             {
-                Build();
+                bool result = LoadOctree();
+                if (!result)
+                {
+                    // We build as backup
+                    Build();
+                }
             }
+            OctManager.volume = this;
         }
 
         private void OnDestroy()
@@ -83,20 +142,62 @@ namespace OctNav
         /// <summary>
         /// Saves the current octree structure to disk.
         /// </summary>
-        public void SaveOctree()
+        public void SaveOctree(string folderPath = null)
         {
-            if (root == null) return;
-            OctVolumeConvert.SaveFullVolume(SavePath, this);
-        }
+            if (root == null)
+            {
+                return;
+            }
 
+            if (!Directory.Exists(ExternalSceneDataRoot))
+            {
+                Directory.CreateDirectory(ExternalSceneDataRoot);
+            }
+
+
+            if (folderPath != null)
+            {
+                string savePath = Path.Combine(folderPath, SaveFileName);
+                OctVolumeConvert.SaveFullVolume(savePath, this);
+                Debug.Log($"[OctNav] Saved octree to: {savePath}");
+            }
+            else
+            {
+                
+                string savePath = Path.Combine(ExternalSceneDataRoot, SaveFileName);
+                OctVolumeConvert.SaveFullVolume(savePath, this);
+                Debug.Log($"[OctNav] Saved octree to: {savePath}");
+            }
+        }
+        
         /// <summary>
         /// Attempts to load a previously saved octree. Rebuilds graphs if successful.
         /// </summary>
-        public bool LoadOctree()
+        public bool LoadOctree(string folderName = null)
         {
             ResetOctree();
 
-            if (OctVolumeConvert.LoadFullVolume(SavePath, this))
+            bool result = false;
+            if (folderName != null)
+            {
+                string fromInstall = Path.Combine(folderName, SaveFileName);
+                result = OctVolumeConvert.LoadFullVolume(fromInstall, this);
+            }
+            else
+            {
+                string fromInstall = Path.Combine(ExternalSceneDataRoot, SaveFileName);
+                
+                result = OctVolumeConvert.LoadFullVolume(fromInstall, this);
+            }
+            
+
+            if (!result)
+            {
+                string fromCache = Path.Combine(RuntimeSceneDataRoot, SaveFileName);
+                result = OctVolumeConvert.LoadFullVolume(fromCache, this);
+            }
+
+            if (result)
             {
                 BuildGraph();
                 BuildWalkableGraph();
@@ -105,54 +206,69 @@ namespace OctNav
 #if UNITY_EDITOR
             SceneView.RepaintAll();
 #endif
-            return true;
+
+            if (result)
+            {
+                isLoaded = true;
+            }
+            
+            return result;
         }
 
         /// <summary>
         /// Builds a new octree from geometry inside the current bounds.
         /// </summary>
-        public void Build()
+        public void Build(bool automaticResize = false, string folderPath = null)
         {
-            Profiler.BeginSample("Clean");
+            gameObject.transform.position = Vector3.zero;
+            gameObject.transform.rotation = Quaternion.identity;
+            gameObject.transform.localScale = Vector3.one;
+
             float startTime = Time.realtimeSinceStartup;
             ResetOctree();
 
+            if (automaticResize)
+            {
+                var newBounds = OctUtils.CalculateSceneBounds(geometryMask);
+                boundHandles.SetBounds(newBounds.center, newBounds.size);
+                bounds.center = newBounds.center;
+                bounds.size = newBounds.size;
+            }
+
             biggestSide = Mathf.Max(bounds.size.x, bounds.size.y, bounds.size.z);
+
             Vector3 minCorner = bounds.min;
             Vector3 cubeSize = Vector3.one * biggestSide;
-            Vector3 cubeCenter = (minCorner + cubeSize * 0.5f) + transform.position;
+            Vector3 cubeCenter = minCorner + cubeSize * 0.5f;
+
             RootBounds = new Bounds(cubeCenter, cubeSize);
 
             root = new OctNode(RootBounds.center, RootBounds.size, null);
-            root.SubdivideRecursive(maxDepth, geometryMask, bounds);
+            root.SubdivideRecursive(maxDepth, geometryMask, bounds, targetResolution);
 
             GetEmptyLeaves(root);
 
             BuildFaceLinks();
+
             int before = emptyLeaves.Count;
             CullUnreachableNodes();
             int culled = before - emptyLeaves.Count;
 
             BuildGraph();
             CollectAllNodes(root);
-            BuildWalkableGraph();
+            BuildWalkableGraph(true);
 
-            Debug.Log($"[OctNav] Volume build: {Time.realtimeSinceStartup - startTime:F6}s | Empty nodes: {emptyLeaves.Count} | Culled: {culled}");
 #if UNITY_EDITOR
+            Debug.Log(
+                $"[OctNav] Volume build: {Time.realtimeSinceStartup - startTime:F6}s | " +
+                $"Empty nodes: {emptyLeaves.Count} | Culled: {culled}"
+            );
             SceneView.RepaintAll();
 #endif
-            SaveOctree();
 
-
-            //finally
-            //{
-            //    foreach (var kvp in originalConvexStates)
-            //        kvp.Key.convex = kvp.Value;
-            //}
-            Profiler.EndSample();
-            Profiler.enabled = false;
+            SaveOctree(folderPath);
         }
-
+        
         /// <summary>
         /// Find all empty nodes in the volume and add them to the empty leaves list.
         /// </summary>
@@ -201,76 +317,21 @@ namespace OctNav
         /// <summary>
         /// Builds the grounded navigation graph for surface walking.
         /// </summary>
-        public void BuildWalkableGraph()
+        public void BuildWalkableGraph(bool fullBake = false)
         {
-            OctManager.groundGraph.ClearVolume(this);
+            NavMeshSurface surface = GetComponent<NavMeshSurface>() ?? gameObject.AddComponent<NavMeshSurface>();
+            surface.layerMask = geometryMask;
 
-            List<OctNode> walkable = allNodes.Where(IsGroundTile).ToList();
-            walkableSet = new HashSet<OctNode>(walkable);
-
-            foreach (OctNode node in walkable)
+            if (!fullBake && surface.navMeshData != null)
             {
-                for (int i = 0; i < 6; i++)
-                { 
-                    node.faceLinks[i] = node.GetFaceNeighbour((Direction)i); 
-                }
+               // surface.UpdateNavMesh(surface.navMeshData);
             }
-
-            foreach (OctNode node in walkable)
+            else
             {
-                OctManager.groundGraph.AddNode(this, node, true);
-                for (int dir = 0; dir < 6; dir++)
-                {
-                    OctNode neighbor = node.faceLinks[dir];
-                    if (neighbor != null && walkableSet.Contains(neighbor))
-                    { 
-                        OctManager.groundGraph.AddEdge(node, neighbor);
-                    }
-                }
-            }
-
-            foreach (OctNode node in walkable)
-            {
-                List<Direction> missing = new List<Direction>();
-                foreach (Direction dir in new[] { Direction.PosX, Direction.NegX, Direction.PosZ, Direction.NegZ })
-                {
-                    OctNode edgeNode = node.faceLinks[(int)dir];
-                    if (edgeNode == null || !walkableSet.Contains(edgeNode))
-                    {
-                        missing.Add(dir);
-                    }
-                }
-
-                if (missing.Count == 0) continue;
-
-                node.edgeDirs.Clear();
-                node.edgeDirs.AddRange(missing);
-                node.isEdge = true;
-/*
-                foreach (Direction dir in missing)
-                {
-                    OctNode next = node.faceLinks[(int)dir];
-                    if (next == null) continue;
-
-                    OctNode up = next.GetFaceNeighbour(Direction.PosY);
-                    while (up != null && up.hasCollision && up.isLeaf && !walkableSet.Contains(up))
-                    { 
-                        up = up.GetFaceNeighbour(Direction.PosY); 
-                    }
-
-                    if (up != null && walkableSet.Contains(up))
-                    {
-                        OctManager.groundGraph.AddEdge(node, up); 
-                    }
-                }*/
+                surface.BuildNavMesh();
             }
         }
-        private bool IsGroundTile(OctNode node)
-        {
-            // in future, set cull leaves to hit leaves
-            OctNode top = node.GetFaceNeighbour(Direction.PosY);
-            return node.hasCollision && node.isLeaf && top != null && !top.hasCollision;
-        }
+       
 
         private void CullUnreachableNodes()
         {
@@ -404,8 +465,11 @@ namespace OctNav
                 }
             }
         }
+        public Bounds GetBounds()
+        {
+            return bounds;
+        }
 
-    
         private void CollectAllNodes(OctNode node)
         {
             if (node == null) return;
@@ -428,7 +492,6 @@ namespace OctNav
         public void ResetOctree()
         {
             OctManager.graph.ClearVolume(this);
-            OctManager.groundGraph.ClearVolume(this);
             Collider[] hits = Physics.OverlapBox(bounds.center, bounds.size, Quaternion.identity, geometryMask);
             surfaceObjects = new List<Collider>(hits);
             root = new OctNode(RootBounds.center, RootBounds.size, null);
@@ -466,7 +529,7 @@ namespace OctNav
                     node.isLeaf = false;
                     node.hasCollision = false;
                     node.children = null;
-                    node.SubdivideRecursive(maxDepth, geometryMask, bounds);
+                    node.SubdivideRecursive(maxDepth, geometryMask, bounds, targetResolution);
                 }
             }
 
@@ -530,7 +593,7 @@ namespace OctNav
         private OctNode FindContainingNode(OctNode node, Vector3 point)
         {
             if (node.isLeaf) return node;
-            foreach (var child in node.children ?? Array.Empty<OctNode>())
+            foreach (OctNode child in node.children ?? Array.Empty<OctNode>())
             {
                 if (child.bounds.Contains(point))
                 {
@@ -606,7 +669,6 @@ namespace OctNav
             if (drawGroundedGraph)
             {
                 Gizmos.color = Color.yellow;
-                OctManager.groundGraph.DrawGraphGizmos();
             }
             if (showSurfaceObjectGizmos)
             {
@@ -648,8 +710,8 @@ namespace OctNav
                         foreach (OctNavGraph.GraphEdge edge in node.edges)
                         {
                             OctNavGraph.GraphNode target = (edge.a == node) ? edge.b : edge.a;
-                            Gizmos.DrawLine(node.center, target.center);
-                            Gizmos.DrawSphere(target.center, 0.05f);
+                            Gizmos.DrawLine(node.Center, target.Center);
+                            Gizmos.DrawSphere(target.Center, 0.05f);
                         }
                     }
                 }

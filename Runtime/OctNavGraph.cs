@@ -1,6 +1,9 @@
+using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Runtime.CompilerServices;
 using UnityEngine;
+using UnityEngine.Profiling;
 
 namespace OctNav
 {
@@ -13,7 +16,9 @@ namespace OctNav
         Manhattan,
         Euclidean,
         Goober,
-        Andradian
+        Andradian,
+        EuclideanUpBiased, 
+        GooberUpBiased
     }
 
     /// <summary>
@@ -21,13 +26,19 @@ namespace OctNav
     /// </summary>
     public class OctNavGraph
     {
+        public float upBias = 0.8f;
+        public float downBias = 1.2f;
         public readonly Dictionary<OctNode, GraphNode> nodes = new Dictionary<OctNode, GraphNode>();
         public readonly HashSet<GraphEdge> edges = new HashSet<GraphEdge>();
-
+        
+        private OctVolume lastVolume;
+        
+        
         private readonly Dictionary<OctNode, OctVolume> nodeToVolumeMap = new Dictionary<OctNode, OctVolume>();
 
-        public int maxIterations = 500; //500 is alot we should see numbers from 30-200
+        public int maxIterations = 200;
         public HeuristicType heuristicType;
+        private int currentSearchId = 0;
         int count = 0;
 
         /// <summary>
@@ -37,80 +48,74 @@ namespace OctNav
         {
             static int nextId;
             public readonly int id;
-
+            public int lastSearchId;
+            public int closedSearchId;
+            public int openSearchId;
+            
             public float f, g, h;
             public GraphNode from;
 
             /// <summary>
             /// Gets the vector from the 'from' node to this node, used for directional heuristics.
             /// </summary>
-            public Vector3 fromDirection => from != null ? center - from.center : Vector3.zero;
+            public Vector3 fromDirection => from != null ? Center - from.Center : Vector3.zero;
 
             public bool isHitNode;
             public List<GraphEdge> edges = new List<GraphEdge>();
 
             public OctNode octreeNode;
+            private Vector3 cachedCenter;
+            private Vector3 cachedSize;
 
             /// <summary>
             /// Gets the center position of the node, accounting for edge direction if applicable.
             /// </summary>
-            public Vector3 center
-            {
-                get
-                {
-                    Vector3 _center = octreeNode.bounds.center;
-
-                    if (isHitNode)
-                    {
-                        Vector3 ext = octreeNode.bounds.extents;
-
-                        _center.y += ext.y;
-                        if (octreeNode.isEdge)
-                        {
-                            foreach (Direction dir in octreeNode.edgeDirs)
-                            {
-                                switch (dir)
-                                {
-                                    case Direction.PosX: _center.x += ext.x; break;
-                                    case Direction.NegX: _center.x -= ext.x; break;
-                                    case Direction.PosZ: _center.z += ext.z; break;
-                                    case Direction.NegZ: _center.z -= ext.z; break;
-                                }
-                            }
-                        }
-                    }
-
-                    return _center;
-                }
-            }
+            public Vector3 Center => cachedCenter;
 
             /// <summary>
             /// Gets the bounds of the node centered around its adjusted center.
             /// </summary>
-            public Bounds bounds
-            {
-                get
-                {
-                    Vector3 _center = center;
-
-                    Vector3 _size = octreeNode.bounds.size;
-
-                    return new Bounds(_center, _size);
-                }
-            }
+            public Bounds Bounds => octreeNode.bounds;
 
             /// <summary>
             /// Gets the size of the node's bounding volume.
             /// </summary>
-            public Vector3 size => octreeNode.bounds.size;
+            public Vector3 Size => cachedSize;
 
             public GraphNode(OctNode octreeNode, bool isHitNode = false)
             {
                 this.id = nextId++;
                 this.octreeNode = octreeNode;
                 this.isHitNode = isHitNode;
+                RecalculateCachedGeometry();
             }
+            public void RecalculateCachedGeometry()
+            {
+                Vector3 c = octreeNode.bounds.center;
 
+                if (isHitNode)
+                {
+                    Vector3 ext = octreeNode.bounds.extents;
+                    c.y += ext.y;
+
+                    if (octreeNode.isEdge)
+                    {
+                        Direction[] dirs = octreeNode.edgeDirs;
+                        for (int i = 0; i < dirs.Length; i++)
+                        {
+                            Direction dir = dirs[i];
+                            if (dir == Direction.PosX) c.x += ext.x;
+                            else if (dir == Direction.NegX) c.x -= ext.x;
+                            else if (dir == Direction.PosZ) c.z += ext.z;
+                            else if (dir == Direction.NegZ) c.z -= ext.z;
+                        }
+                    }
+                }
+
+                cachedCenter = c;
+                cachedSize = octreeNode.bounds.size;
+            }
+            
             public override bool Equals(object obj)
             {
                 return obj is GraphNode other && other.id == id;
@@ -145,104 +150,139 @@ namespace OctNav
                 return a.GetHashCode() ^ b.GetHashCode();
             }
         }
+        
+        private readonly OctUtils.BinaryHeapPriorityQueue<GraphNode> openQueue =
+            new OctUtils.BinaryHeapPriorityQueue<GraphNode>();
 
-        public List<GraphNode> AStar(OctNode startNode, OctNode endNode, HeuristicType heuristic)
+        private readonly List<GraphNode> pathBuffer =
+            new List<GraphNode>(128);
+        
+        public List<GraphNode> AStar(GraphNode start, GraphNode end, HeuristicType heuristic)
         {
-            heuristicType = heuristic; 
+            currentSearchId++;
+            heuristicType = heuristic;
             count = 0;
-            GraphNode start = FindNode(startNode);
-            GraphNode end = FindNode(endNode);
-
- /*           DrawBounds2D(startNode.bounds,Color.green);
-            DrawBounds2D(endNode.bounds,Color.cyan);*/
+        
             if (start == null || end == null)
             {
-                Debug.LogWarning("Start or End node not found in the graph.");
                 return null;
             }
-            foreach (GraphNode node in nodes.Values)
+        
+            // Reset node state (no allocations)
+            Dictionary<OctNode, GraphNode>.ValueCollection nodeValues = nodes.Values;
+            foreach (GraphNode node in nodeValues)
             {
                 node.f = float.PositiveInfinity;
                 node.g = float.PositiveInfinity;
                 node.h = 0f;
                 node.from = null;
             }
-
-            SortedSet<GraphNode> openSet = new SortedSet<GraphNode>(new NodeComparer());
-            HashSet<GraphNode> closedSet = new HashSet<GraphNode>();
-
-            start.g = 0;
-            start.h = Heuristic(start, end);    
-            start.f = start.g + start.h;
-
+        
+            openQueue.Clear();
+            pathBuffer.Clear();
+            
+            InitNodeIfNeeded(start);
+            start.g = 0f;
+            start.h = Heuristic(start, end);
+            start.f = start.h;
+        
             GraphNode bestReached = start;
-            float bestH = Heuristic(start, end);
-            openSet.Add(start);
-            List<GraphNode> pathList = new List<GraphNode>();
-            while (openSet.Count > 0)
+            float bestH = start.h;
+        
+            openQueue.Enqueue(start, start.f);
+        
+            while (openQueue.Count > 0)
             {
                 if (++count > maxIterations)
                 {
-                  //  Debug.LogWarning($"A* exceeded maximum iterations, utilizing fallback. Iterations{maxIterations}");
                     break;
                 }
-
-                GraphNode current = openSet.First();
-                openSet.Remove(current);
-
+        
+                GraphNode current = openQueue.Dequeue();
+        
+                if (current.closedSearchId == currentSearchId)
+                {
+                    continue;
+                }
+        
                 if (current.h < bestH)
                 {
                     bestH = current.h;
                     bestReached = current;
                 }
-
-                if (current.Equals(end))
+        
+                if (current == end)
                 {
-                    ReconstructPath(pathList, current);
-                    return pathList;
-
+                    ReconstructPath(pathBuffer, current);
+                    return pathBuffer;
                 }
-
-                closedSet.Add(current);
-
-                foreach (GraphEdge edge in current.edges)
+        
+                current.closedSearchId = currentSearchId;
+        
+                List<GraphEdge> edges = current.edges;
+                for (int i = 0; i < edges.Count; i++)
                 {
-                    GraphNode neighbor = (edge.a == current) ? edge.b : edge.a;
+                    GraphEdge edge = edges[i];
+                    GraphNode neighbor = Equals(edge.a, current) ? edge.b : edge.a;
+        
+                    if (neighbor.closedSearchId == currentSearchId)
+                    {
+                        continue;
+                    }
 
-                    if (closedSet.Contains(neighbor)) continue;
                     float tentativeG = current.g + Heuristic(current, neighbor);
-
+        
+                    InitNodeIfNeeded(neighbor);
 
                     if (tentativeG < neighbor.g)
                     {
-                       // Debug.DrawLine(current.center, neighbor.center, Color.green, 10f);
                         neighbor.from = current;
                         neighbor.g = tentativeG;
                         neighbor.h = Heuristic(neighbor, end);
                         neighbor.f = neighbor.g + neighbor.h;
-
-                        openSet.Remove(neighbor);  // always remove/re-add to refresh order
-                        openSet.Add(neighbor);
+                        
+                        if (neighbor.openSearchId != currentSearchId)
+                        {
+                            neighbor.openSearchId = currentSearchId;
+                            openQueue.Enqueue(neighbor, neighbor.f);
+                        }
                     }
                 }
             }
-            List<GraphNode> fallbackPath = new List<GraphNode>();
-            ReconstructPath(fallbackPath, bestReached);
-            return fallbackPath.Count <2 ? null : fallbackPath; // fallback path since a lot of the reason why it fails is that its too far from the target
+        
+            // Fallback path
+            pathBuffer.Clear();
+            ReconstructPath(pathBuffer, bestReached);
+            return pathBuffer.Count < 2 ? null : pathBuffer;
         }
-
+        
+        private void InitNodeIfNeeded(GraphNode node)
+        {
+            if (node.lastSearchId != currentSearchId)
+            {
+                node.lastSearchId = currentSearchId;
+                node.g = float.PositiveInfinity;
+                node.f = float.PositiveInfinity;
+                node.h = 0f;
+                node.from = null;
+            }
+        }
+        
         /// <summary>
         /// Reconstructs the path from end node back to start.
         /// </summary>
-        private void ReconstructPath(List<GraphNode> pathList, GraphNode current)
+        private void ReconstructPath(List<GraphNode> buffer, GraphNode endNode)
         {
+            buffer.Clear();
+
+            GraphNode current = endNode;
             while (current != null)
             {
-                pathList.Add(current);
+                buffer.Add(current);
                 current = current.from;
             }
 
-            pathList.Reverse();
+            buffer.Reverse();
         }
 
         /// <summary>
@@ -250,8 +290,8 @@ namespace OctNav
         /// </summary>
         private float Heuristic(GraphNode a, GraphNode b)
         {
-            Vector3 centerA = a.center;
-            Vector3 centerB = b.center;
+            Vector3 centerA = a.Center;
+            Vector3 centerB = b.Center;
          
             float dx = Mathf.Abs(centerA.x - centerB.x);
             float dy = Mathf.Abs(centerA.y - centerB.y);
@@ -263,9 +303,9 @@ namespace OctNav
             switch (heuristicType)
             {
                 case HeuristicType.Morrisium:
-                    float dnx = Mathf.Abs(diff.x) - (a.size.x * 0.5f + b.size.x * 0.5f);
-                    float dny = Mathf.Abs(diff.y) - (a.size.y * 0.5f + b.size.y * 0.5f);
-                    float dnz = Mathf.Abs(diff.z) - (a.size.z * 0.5f + b.size.z * 0.5f);
+                    float dnx = Mathf.Abs(diff.x) - (a.Size.x * 0.5f + b.Size.x * 0.5f);
+                    float dny = Mathf.Abs(diff.y) - (a.Size.y * 0.5f + b.Size.y * 0.5f);
+                    float dnz = Mathf.Abs(diff.z) - (a.Size.z * 0.5f + b.Size.z * 0.5f);
                     dnx = Mathf.Max(0f, dnx);
                     dny = Mathf.Max(0f, dny);
                     dnz = Mathf.Max(0f, dnz);
@@ -277,7 +317,7 @@ namespace OctNav
                 case HeuristicType.Euclidean:
                     return (dx * dx + dy * dy + dz * dz);                
                 case HeuristicType.Goober:
-                    return  (a.bounds.center - b.bounds.ClosestPoint(a.bounds.center)).sqrMagnitude;
+                    return  (a.Bounds.center - b.Bounds.ClosestPoint(a.Bounds.center)).sqrMagnitude; // using bounds isnt the most efficent
               /*  case HeuristicType.Straight:
                     
                     Vector3 prevDir = a.fromDirection.normalized;
@@ -290,6 +330,19 @@ namespace OctNav
                     float directionalWeight = ( (a.fromDirection - b.fromDirection).sqrMagnitude)+ 1;
                 return directionalWeight * (dx * dx + dy * dy + dz * dz);
 
+                case HeuristicType.EuclideanUpBiased:
+                    {
+                        float baseCost = dx * dx + dy * dy + dz * dz;
+                        float mult = centerB.y > centerA.y ? upBias : centerB.y < centerA.y ? downBias : 1f;
+                        return baseCost * mult;
+                    }
+
+                case HeuristicType.GooberUpBiased:
+                    {
+                        float baseCost = (a.Bounds.center - b.Bounds.ClosestPoint(a.Bounds.center)).sqrMagnitude; // using bounds isnt the most efficent
+                        float mult = centerB.y > centerA.y ? upBias : centerB.y < centerA.y ? downBias : 1f;
+                        return baseCost * mult;
+                    }
                 default:
                     return (dx * dx + dy * dy + dz * dz);
 
@@ -392,11 +445,11 @@ namespace OctNav
         {
             foreach (GraphEdge edge in edges)
             {
-                Gizmos.DrawLine(edge.a.center, edge.b.center);
+                Gizmos.DrawLine(edge.a.Center, edge.b.Center);
             }
             foreach (GraphNode node in nodes.Values)
             {
-                Gizmos.DrawWireSphere(node.center,0.1f);
+                Gizmos.DrawWireSphere(node.Center,0.1f);
             }
         }
 
@@ -408,12 +461,15 @@ namespace OctNav
             nodes.TryGetValue(octreeNode, out GraphNode node);
             return node;
         }
+       
 
         /// <summary>
         /// Finds the closest OctNode in the graph to a given position.
         /// </summary>
-        public OctNode GetClosestNode(Vector3 position)
+        public OctNode GetClosestOctNode(Vector3 position)
         {
+           // OctVolume volume;
+           // volume.FindNodeAtPoint(position, out OctNode nodeAtPoint);
             OctNode closestNode = null;
             float closestDistanceSqr = Mathf.Infinity;
 
@@ -430,6 +486,370 @@ namespace OctNav
             }
 
             return closestNode;
+        }
+
+        public GraphNode GetClosestNodeLegacy(Vector3 position)
+        {
+            GraphNode closestNode = null;
+            float closestDistanceSqr = Mathf.Infinity;
+
+            foreach (KeyValuePair<OctNode, GraphNode> nodePair in nodes)
+            {
+                GraphNode node = nodePair.Value;
+
+                float distanceSqr = (node.Bounds.ClosestPoint(position) - position).sqrMagnitude;
+                if (distanceSqr < closestDistanceSqr)
+                {
+                    closestDistanceSqr = distanceSqr;
+                    closestNode = node;
+                }
+            }
+
+            return closestNode;
+        }
+        public GraphNode GetClosestNode(Vector3 position)
+        {
+            lastVolume = OctManager.volume;
+
+            if (lastVolume == null)
+            {
+                Debug.LogWarning("OctManager.volume is null");
+                return null;
+            }
+
+            if (lastVolume.bounds.Contains(position))
+            {
+                GraphNode node = GetClosestNodeInsideVolume(position);
+                if (node != null)
+                {
+                    return node;
+                }
+
+                return RecoverClosestNodeNearPosition(lastVolume, position);
+            }
+
+            return GetClosestNodeFromOutsideVolume(position);
+        }
+        
+        private GraphNode RecoverClosestNodeNearPosition(OctVolume volume, Vector3 position)
+        {
+            const float verticalStep = 1.0f;
+            const float maxVertical = 6.0f;
+            const float radialStep = 1.0f;
+            const float maxRadius = 15.0f;
+
+            for (float y = verticalStep; y <= maxVertical; y += verticalStep)
+            {
+                Vector3 up = position + Vector3.up * y;
+                if (volume.bounds.Contains(up))
+                {
+                    GraphNode n = GetClosestNodeInsideVolume(up);
+                    if (n != null) return n;
+                }
+
+                Vector3 down = position - Vector3.up * y;
+                if (volume.bounds.Contains(down))
+                {
+                    GraphNode n = GetClosestNodeInsideVolume(down);
+                    if (n != null) return n;
+                }
+            }
+
+            for (float r = radialStep; r <= maxRadius; r += radialStep)
+            {
+                for (int i = 0; i < 8; i++)
+                {
+                    float angle = i * Mathf.PI * 0.25f;
+                    Vector3 offset = new Vector3(Mathf.Cos(angle), 0f, Mathf.Sin(angle)) * r;
+                    Vector3 sample = position + offset;
+
+                    if (!volume.bounds.Contains(sample))
+                    {
+                        continue;
+                    }
+
+                    GraphNode n = GetClosestNodeInsideVolume(sample);
+                    if (n != null) return n;
+                }
+            }
+
+            Debug.LogWarning(
+                $"[OctNav] Recovery failed: position {position} is in playable space but not represented by octree."
+            );
+
+            return null;
+        }
+        private GraphNode GetClosestNodeInsideVolume(Vector3 position)
+        {
+            GraphNode direct = TryGetGraphNodeAtPoint(lastVolume, position);
+            if (direct != null)
+            {
+                return direct;
+            }
+
+            GraphNode probed = ProbeAroundPointForGraphNode(lastVolume, position);
+            if (probed != null)
+            {
+                return probed;
+            }
+            
+            return null;
+        }
+        private GraphNode GetClosestNodeFromOutsideVolume(Vector3 position)
+        {
+            Vector3 clamped = MovePointSlightlyInsideBounds(lastVolume, position);
+
+            GraphNode node = GetClosestNodeInsideVolume(clamped);
+
+            if (node == null)
+            {
+                Debug.LogError(
+                    $"[OctNav] Failed to resolve GraphNode after clamping outside position. " +
+                    $"Original={position}, Clamped={clamped}, Volume={lastVolume.name}"
+                );
+            }
+
+            return node;
+        }
+        
+        private Vector3 MovePointSlightlyInsideBounds(OctVolume volume, Vector3 outsidePosition)
+        {
+            Bounds b = volume.bounds;
+        
+            Vector3 closestOnBounds = b.ClosestPoint(outsidePosition);
+            Vector3 inwardDirection = closestOnBounds - outsidePosition;
+        
+            if (inwardDirection.sqrMagnitude < 1e-8f)
+            {
+                inwardDirection = closestOnBounds - b.center;
+            }
+            if (inwardDirection.sqrMagnitude < 1e-8f)
+            {
+                inwardDirection = Vector3.up;
+            }
+        
+            inwardDirection.Normalize();
+            float inset = Mathf.Max(0.01f, 0.002f * b.size.magnitude);
+        
+            Vector3 insidePoint = closestOnBounds + inwardDirection * inset;
+        
+            if (b.Contains(insidePoint) == false)
+            {
+                Vector3 towardCenter = (b.center - closestOnBounds);
+                if (towardCenter.sqrMagnitude < 1e-8f)
+                {
+                    towardCenter = Vector3.up;
+                }
+                insidePoint = closestOnBounds + towardCenter.normalized * inset;
+            }
+        
+            return insidePoint;
+        }
+        
+        private GraphNode TryGetGraphNodeAtPoint(OctVolume volume, Vector3 point)
+        {
+            OctNode leaf = volume.FindNodeAtPoint(point);
+            if (leaf == null)
+            {
+                return null;
+            }
+        
+            if (leaf.hasCollision == false)
+            {
+                GraphNode mapped;
+                bool found = nodes.TryGetValue(leaf, out mapped);
+                if (found == true)
+                {
+                    return mapped;
+                }
+            }
+        
+            GraphNode bfs = NearestEmptyViaBfs(leaf, point, 64);
+            return bfs;
+        }
+        
+        private GraphNode ProbeAroundPointForGraphNode(OctVolume volume, Vector3 center)
+        {
+            float probe = Mathf.Max(0.01f, 0.002f * volume.bounds.size.magnitude);
+        
+            for (int axis = 0; axis < 3; axis++)
+            {
+                for (int sign = -1; sign <= 1; sign += 2)
+                {
+                    Vector3 offset = Vector3.zero;
+                    if (axis == 0)
+                    {
+                        offset.x = probe * sign;
+                    }
+                    else if (axis == 1)
+                    {
+                        offset.y = probe * sign;
+                    }
+                    else
+                    {
+                        offset.z = probe * sign;
+                    }
+        
+                    Vector3 sample = center + offset;
+        
+                    if (volume.bounds.Contains(sample) == false)
+                    {
+                        continue;
+                    }
+        
+                    GraphNode node = TryGetGraphNodeAtPoint(volume, sample);
+                    if (node != null)
+                    {
+                        return node;
+                    }
+                }
+            }
+        
+            return null;
+        }
+        
+        private GraphNode NearestGraphNodeLinear(Vector3 position, OctVolume volumeFilter)
+        {
+            GraphNode bestNode = null;
+            float bestDistanceSqr = float.PositiveInfinity;
+        
+            foreach (KeyValuePair<OctNode, GraphNode> pair in nodes)
+            {
+                OctNode octNode = pair.Key;
+        
+                if (volumeFilter != null)
+                {
+                    OctVolume mappedVolume;
+                    bool mapped = nodeToVolumeMap.TryGetValue(octNode, out mappedVolume);
+                    if (mapped == false)
+                    {
+                        continue;
+                    }
+                    if (mappedVolume != volumeFilter)
+                    {
+                        continue;
+                    }
+                }
+        
+                GraphNode candidate = pair.Value;
+        
+                Vector3 closest = candidate.Bounds.ClosestPoint(position);
+                float distanceSqr = (closest - position).sqrMagnitude;
+        
+                if (distanceSqr < bestDistanceSqr)
+                {
+                    bestDistanceSqr = distanceSqr;
+                    bestNode = candidate;
+                }
+            }
+        
+            return bestNode;
+        }
+        
+        private readonly OctNode[] bfsQueue = new OctNode[256];
+        private int bfsQueueHead;
+        private int bfsQueueTail;
+
+        private int currentBfsSearchId = 0;
+        
+        private GraphNode NearestEmptyViaBfs(OctNode start, Vector3 sample, int maxVisits)
+        {
+            currentBfsSearchId++;
+
+            bfsQueueHead = 0;
+            bfsQueueTail = 0;
+
+            start.bfsSearchId = currentBfsSearchId;
+            bfsQueue[bfsQueueTail++] = start;
+
+            OctNode bestLeaf = null;
+            float bestDistSqr = float.PositiveInfinity;
+
+            int visits = 0;
+
+            while (bfsQueueHead < bfsQueueTail && visits < maxVisits)
+            {
+                OctNode current = bfsQueue[bfsQueueHead++];
+                visits++;
+
+                if (!current.hasCollision)
+                {
+                    GraphNode gn;
+                    if (nodes.TryGetValue(current, out gn))
+                    {
+                        Vector3 d = gn.Center - sample;
+                        float distSqr = d.sqrMagnitude;
+
+                        if (distSqr < bestDistSqr)
+                        {
+                            bestDistSqr = distSqr;
+                            bestLeaf = current;
+                        }
+                    }
+                }
+
+                for (int i = 0; i < 6; i++)
+                {
+                    OctNode neigh = current.faceLinks != null
+                        ? current.faceLinks[i]
+                        : current.GetFaceNeighbour((Direction)i);
+
+                    if (neigh == null)
+                    {
+                        continue;
+                    }
+
+                    if (neigh.bfsSearchId == currentBfsSearchId)
+                    {
+                        continue;
+                    }
+
+                    neigh.bfsSearchId = currentBfsSearchId;
+
+                    if (bfsQueueTail < bfsQueue.Length)
+                    {
+                        bfsQueue[bfsQueueTail++] = neigh;
+                    }
+                }
+            }
+
+            if (bestLeaf != null)
+            {
+                return nodes[bestLeaf];
+            }
+
+            return null;
+        }
+
+        public GraphNode GetClosestNodeNew(Vector3 position)
+        {
+            GraphNode current = nodes.First().Value;
+            float closestDistanceSqr = (current.Bounds.ClosestPoint(position) - position).sqrMagnitude;
+
+            bool moved = false;
+            do
+            {
+                moved = false;
+                foreach (GraphEdge edge in current.edges)
+                {
+                    GraphNode neighbor = (edge.a == current) ? edge.b : edge.a;
+                    float distanceSqr = (neighbor.Bounds.ClosestPoint(position) - position).sqrMagnitude;
+                    if (distanceSqr < closestDistanceSqr)
+                    {
+                        closestDistanceSqr = distanceSqr;
+                        current = neighbor;
+                        moved = true;
+                        break;
+                    }
+                }
+            }
+            while (moved);
+
+            if (current == null)
+            {
+                Debug.Log("null node");    
+            }
+            return current;
         }
     }
 }
